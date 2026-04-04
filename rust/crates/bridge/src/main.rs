@@ -157,7 +157,21 @@ fn main() -> Result<(), Error> {
     let mut respond = pin!(responder.run::<4, 4>());
     let mut dm_job = pin!(dm.run());
 
-    let socket = async_io::Async::<UdpSocket>::bind(MATTER_SOCKET_BIND_ADDR)?;
+    // Create a dual-stack UDP socket explicitly via socket2.
+    // Rust's std UdpSocket::bind on "[::]:port" may set IPV6_V6ONLY=1,
+    // which prevents receiving IPv6 packets from chip-tool.
+    let socket = {
+        let s = socket2::Socket::new(
+            socket2::Domain::IPV6,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+        s.set_only_v6(false)?;
+        s.set_reuse_address(true)?;
+        s.bind(&MATTER_SOCKET_BIND_ADDR.into())?;
+        s.set_nonblocking(true)?;
+        async_io::Async::<UdpSocket>::new_nonblocking(s.into())?
+    };
 
     let mut mdns = pin!(mdns::run_mdns(&matter, &crypto, dm.change_notify()));
     let mut transport = pin!(matter.run(&crypto, &socket, &socket, &socket));
