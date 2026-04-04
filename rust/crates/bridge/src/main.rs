@@ -160,6 +160,7 @@ fn main() -> Result<(), Error> {
             rand,
             &av_handlers,
             &webrtc_handlers,
+            &camera_states,
         ),
     );
 
@@ -254,18 +255,26 @@ const NODE: Node<'static> = Node {
 
 // ── BridgedDeviceBasicInformation handler ──
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct BridgedHandler {
     dataver: Dataver,
+    state: Arc<RwLock<CameraEndpointState>>,
 }
 
 impl BridgedHandler {
-    pub const fn new(dataver: Dataver) -> Self {
-        Self { dataver }
+    pub fn new(dataver: Dataver, state: Arc<RwLock<CameraEndpointState>>) -> Self {
+        Self { dataver, state }
     }
 
-    pub const fn adapt(self) -> bridged_device_basic_information::HandlerAdaptor<Self> {
+    pub fn adapt(self) -> bridged_device_basic_information::HandlerAdaptor<Self> {
         bridged_device_basic_information::HandlerAdaptor(self)
+    }
+
+    fn read_state_string(&self, f: impl Fn(&CameraEndpointState) -> &str) -> String {
+        self.state
+            .read()
+            .map(|s| f(&s).to_string())
+            .unwrap_or_default()
     }
 }
 
@@ -273,7 +282,7 @@ impl bridged_device_basic_information::ClusterHandler for BridgedHandler {
     const CLUSTER: rs_matter::dm::Cluster<'static> =
         bridged_device_basic_information::FULL_CLUSTER
             .with_features(0)
-            .with_attrs(with!(required))
+            .with_attrs(with!(all))
             .with_cmds(with!());
 
     fn dataver(&self) -> u32 {
@@ -285,17 +294,70 @@ impl bridged_device_basic_information::ClusterHandler for BridgedHandler {
     }
 
     fn reachable(&self, _ctx: impl ReadContext) -> Result<bool, Error> {
-        // Stub: always reachable. Phase 2 will wire this to ONVIF discovery state.
-        Ok(true)
+        Ok(self.state.read().map(|s| s.occupied).unwrap_or(false))
     }
 
     fn unique_id<P: TLVBuilderParent>(
         &self,
         _ctx: impl ReadContext,
-        _builder: Utf8StrBuilder<P>,
+        builder: Utf8StrBuilder<P>,
     ) -> Result<P, Error> {
-        // Optional attribute, not yet implemented
-        Err(rs_matter::error::ErrorCode::AttributeNotFound.into())
+        let val = self.read_state_string(|s| &s.unique_id);
+        builder.set(&val)
+    }
+
+    fn vendor_name<P: TLVBuilderParent>(
+        &self,
+        _ctx: impl ReadContext,
+        builder: Utf8StrBuilder<P>,
+    ) -> Result<P, Error> {
+        let val = self.read_state_string(|s| &s.vendor_name);
+        builder.set(&val)
+    }
+
+    fn product_name<P: TLVBuilderParent>(
+        &self,
+        _ctx: impl ReadContext,
+        builder: Utf8StrBuilder<P>,
+    ) -> Result<P, Error> {
+        let val = self.read_state_string(|s| &s.product_name);
+        builder.set(&val)
+    }
+
+    fn node_label<P: TLVBuilderParent>(
+        &self,
+        _ctx: impl ReadContext,
+        builder: Utf8StrBuilder<P>,
+    ) -> Result<P, Error> {
+        let val = self.read_state_string(|s| &s.node_label);
+        builder.set(&val)
+    }
+
+    fn serial_number<P: TLVBuilderParent>(
+        &self,
+        _ctx: impl ReadContext,
+        builder: Utf8StrBuilder<P>,
+    ) -> Result<P, Error> {
+        let val = self.read_state_string(|s| &s.serial_number);
+        builder.set(&val)
+    }
+
+    fn hardware_version_string<P: TLVBuilderParent>(
+        &self,
+        _ctx: impl ReadContext,
+        builder: Utf8StrBuilder<P>,
+    ) -> Result<P, Error> {
+        let val = self.read_state_string(|s| &s.hardware_version_string);
+        builder.set(&val)
+    }
+
+    fn software_version_string<P: TLVBuilderParent>(
+        &self,
+        _ctx: impl ReadContext,
+        builder: Utf8StrBuilder<P>,
+    ) -> Result<P, Error> {
+        let val = self.read_state_string(|s| &s.software_version_string);
+        builder.set(&val)
     }
 
     fn handle_keep_active(
@@ -303,7 +365,6 @@ impl bridged_device_basic_information::ClusterHandler for BridgedHandler {
         _ctx: impl InvokeContext,
         _request: KeepActiveRequest<'_>,
     ) -> Result<(), Error> {
-        // Not applicable for camera bridge
         Err(rs_matter::error::ErrorCode::CommandNotFound.into())
     }
 }
@@ -318,6 +379,7 @@ fn dm_handler<'a>(
     mut rand: impl RngCore + Copy,
     av_handlers: &'a [AvStreamHandler],
     webrtc_handlers: &'a [WebRtcHandler],
+    camera_states: &'a [Arc<RwLock<CameraEndpointState>>],
 ) -> impl AsyncMetadata + AsyncHandler + 'a {
     // Build the camera endpoint handler chain
     let mut chain = EmptyHandler
@@ -335,7 +397,7 @@ fn dm_handler<'a>(
     //
     // For Phase 1, we'll use a helper that chains all 16 endpoints.
     macro_rules! chain_camera_ep {
-        ($chain:expr, $rand:expr, $av:expr, $webrtc:expr, $ep:expr, $idx:expr) => {
+        ($chain:expr, $rand:expr, $av:expr, $webrtc:expr, $states:expr, $ep:expr, $idx:expr) => {
             $chain
                 .chain(
                     EpClMatcher::new(Some($ep), Some(desc::DescHandler::CLUSTER.id)),
@@ -347,7 +409,7 @@ fn dm_handler<'a>(
                 )
                 .chain(
                     EpClMatcher::new(Some($ep), Some(BridgedHandler::CLUSTER.id)),
-                    Async(BridgedHandler::new(Dataver::new_rand(&mut $rand)).adapt()),
+                    Async(BridgedHandler::new(Dataver::new_rand(&mut $rand), Arc::clone(&$states[$idx])).adapt()),
                 )
                 .chain(
                     EpClMatcher::new(Some($ep), Some(AV_STREAM_CLUSTER.id)),
@@ -360,22 +422,22 @@ fn dm_handler<'a>(
         };
     }
 
-    let chain = chain_camera_ep!(chain, rand, av_handlers, webrtc_handlers, 2, 0);
-    let chain = chain_camera_ep!(chain, rand, av_handlers, webrtc_handlers, 3, 1);
-    let chain = chain_camera_ep!(chain, rand, av_handlers, webrtc_handlers, 4, 2);
-    let chain = chain_camera_ep!(chain, rand, av_handlers, webrtc_handlers, 5, 3);
-    let chain = chain_camera_ep!(chain, rand, av_handlers, webrtc_handlers, 6, 4);
-    let chain = chain_camera_ep!(chain, rand, av_handlers, webrtc_handlers, 7, 5);
-    let chain = chain_camera_ep!(chain, rand, av_handlers, webrtc_handlers, 8, 6);
-    let chain = chain_camera_ep!(chain, rand, av_handlers, webrtc_handlers, 9, 7);
-    let chain = chain_camera_ep!(chain, rand, av_handlers, webrtc_handlers, 10, 8);
-    let chain = chain_camera_ep!(chain, rand, av_handlers, webrtc_handlers, 11, 9);
-    let chain = chain_camera_ep!(chain, rand, av_handlers, webrtc_handlers, 12, 10);
-    let chain = chain_camera_ep!(chain, rand, av_handlers, webrtc_handlers, 13, 11);
-    let chain = chain_camera_ep!(chain, rand, av_handlers, webrtc_handlers, 14, 12);
-    let chain = chain_camera_ep!(chain, rand, av_handlers, webrtc_handlers, 15, 13);
-    let chain = chain_camera_ep!(chain, rand, av_handlers, webrtc_handlers, 16, 14);
-    let chain = chain_camera_ep!(chain, rand, av_handlers, webrtc_handlers, 17, 15);
+    let chain = chain_camera_ep!(chain, rand, av_handlers, webrtc_handlers, camera_states, 2, 0);
+    let chain = chain_camera_ep!(chain, rand, av_handlers, webrtc_handlers, camera_states, 3, 1);
+    let chain = chain_camera_ep!(chain, rand, av_handlers, webrtc_handlers, camera_states, 4, 2);
+    let chain = chain_camera_ep!(chain, rand, av_handlers, webrtc_handlers, camera_states, 5, 3);
+    let chain = chain_camera_ep!(chain, rand, av_handlers, webrtc_handlers, camera_states, 6, 4);
+    let chain = chain_camera_ep!(chain, rand, av_handlers, webrtc_handlers, camera_states, 7, 5);
+    let chain = chain_camera_ep!(chain, rand, av_handlers, webrtc_handlers, camera_states, 8, 6);
+    let chain = chain_camera_ep!(chain, rand, av_handlers, webrtc_handlers, camera_states, 9, 7);
+    let chain = chain_camera_ep!(chain, rand, av_handlers, webrtc_handlers, camera_states, 10, 8);
+    let chain = chain_camera_ep!(chain, rand, av_handlers, webrtc_handlers, camera_states, 11, 9);
+    let chain = chain_camera_ep!(chain, rand, av_handlers, webrtc_handlers, camera_states, 12, 10);
+    let chain = chain_camera_ep!(chain, rand, av_handlers, webrtc_handlers, camera_states, 13, 11);
+    let chain = chain_camera_ep!(chain, rand, av_handlers, webrtc_handlers, camera_states, 14, 12);
+    let chain = chain_camera_ep!(chain, rand, av_handlers, webrtc_handlers, camera_states, 15, 13);
+    let chain = chain_camera_ep!(chain, rand, av_handlers, webrtc_handlers, camera_states, 16, 14);
+    let chain = chain_camera_ep!(chain, rand, av_handlers, webrtc_handlers, camera_states, 17, 15);
 
     (
         NODE,

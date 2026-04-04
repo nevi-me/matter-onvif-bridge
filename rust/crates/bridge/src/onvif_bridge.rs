@@ -91,11 +91,15 @@ pub fn start_onvif_bridge(
                 .expect("Failed to create tokio runtime");
 
             rt.block_on(async move {
+                log::info!("ONVIF/media bridge thread started");
+
                 // 1. Start go2rtc
                 if let Err(e) = go2rtc_manager.start().await {
                     log::error!("Failed to start go2rtc: {e}");
                     // Continue anyway — go2rtc may come up later
                 }
+
+                log::info!("go2rtc started, launching stream manager and ONVIF discovery");
 
                 // 2. Spawn stream manager (registers RTSP streams in go2rtc)
                 let api_for_streams = go2rtc_api.clone();
@@ -203,6 +207,22 @@ fn populate_camera_state(state_lock: &Arc<RwLock<CameraEndpointState>>, camera: 
         return;
     };
 
+    // Mark slot as occupied
+    state.occupied = true;
+
+    // BDBI fields from ONVIF device info
+    state.vendor_name = camera.device_info.manufacturer.clone();
+    state.product_name = camera.device_info.model.clone();
+    state.serial_number = camera.device_info.serial_number.clone();
+    state.hardware_version_string = camera.device_info.hardware_id.clone();
+    state.software_version_string = camera.device_info.firmware_version.clone();
+    state.unique_id = camera.id.clone();
+    state.node_label = format!(
+        "{} {}",
+        camera.device_info.manufacturer, camera.device_info.model
+    );
+
+    // Video params from first profile
     if let Some(profile) = camera.profiles.first() {
         if let Some(ve) = &profile.video_encoder {
             state.video_sensor_params = VideoSensorParams {

@@ -173,6 +173,22 @@ pub struct IceServer {
 /// This is shared between CameraAvStreamManagement and WebRtcTransportProvider handlers.
 #[derive(Debug, Clone)]
 pub struct CameraEndpointState {
+    /// Whether a camera is assigned to this endpoint slot.
+    /// When false, BridgedDeviceBasicInformation.reachable returns false
+    /// and controllers should hide this endpoint.
+    pub occupied: bool,
+
+    /// Human-readable label for this bridged device (e.g., "Front Door Camera").
+    pub node_label: String,
+
+    /// Device info from ONVIF (used for BDBI attributes).
+    pub vendor_name: String,
+    pub product_name: String,
+    pub serial_number: String,
+    pub hardware_version_string: String,
+    pub software_version_string: String,
+    pub unique_id: String,
+
     // CameraAvStreamManagement attributes
     pub max_concurrent_video_encoders: u8,
     pub max_encoded_pixel_rate: u32,
@@ -213,6 +229,14 @@ pub struct CameraEndpointState {
 impl Default for CameraEndpointState {
     fn default() -> Self {
         Self {
+            occupied: false,
+            node_label: String::new(),
+            vendor_name: String::new(),
+            product_name: String::new(),
+            serial_number: String::new(),
+            hardware_version_string: String::new(),
+            software_version_string: String::new(),
+            unique_id: String::new(),
             max_concurrent_video_encoders: 1,
             max_encoded_pixel_rate: 0,
             video_sensor_params: VideoSensorParams {
