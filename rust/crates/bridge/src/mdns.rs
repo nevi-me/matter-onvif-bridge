@@ -26,9 +26,14 @@ pub async fn run_mdns<C: Crypto>(
     socket.bind(&MDNS_SOCKET_DEFAULT_BIND_ADDR.into())?;
     let socket = async_io::Async::<UdpSocket>::new_nonblocking(socket.into())?;
 
-    socket
-        .get_ref()
-        .join_multicast_v6(&MDNS_IPV6_BROADCAST_ADDR, interface)?;
+    // Join IPv6 multicast if we have a real IPv6 address
+    if ipv6_addr != Ipv6Addr::from([0; 16]) {
+        socket
+            .get_ref()
+            .join_multicast_v6(&MDNS_IPV6_BROADCAST_ADDR, interface)?;
+    } else {
+        log::warn!("No IPv6 address on network interface — mDNS will be IPv4 only");
+    }
     socket
         .get_ref()
         .join_multicast_v4(&MDNS_IPV4_BROADCAST_ADDR, &ipv4_addr)?;
@@ -50,7 +55,7 @@ pub async fn run_mdns<C: Crypto>(
 }
 
 fn initialize_network() -> Result<(Ipv4Addr, Ipv6Addr, u32), Error> {
-    use nix::{net::if_::InterfaceFlags, sys::socket::SockaddrIn6};
+    use nix::net::if_::InterfaceFlags;
     use rs_matter::error::ErrorCode;
 
     let interfaces = || {
@@ -63,26 +68,29 @@ fn initialize_network() -> Result<(Ipv4Addr, Ipv6Addr, u32), Error> {
         })
     };
 
-    let (iname, ip, ipv6) = interfaces()
-        .filter_map(|ia| {
+    // Find first interface with an IPv4 address
+    let (iname, ip) = interfaces()
+        .find_map(|ia| {
             ia.address
-                .and_then(|addr| addr.as_sockaddr_in6().map(SockaddrIn6::ip))
-                .map(|ipv6| (ia.interface_name, ipv6))
+                .and_then(|addr| addr.as_sockaddr_in().map(|addr| addr.ip().into()))
+                .map(|ip: std::net::Ipv4Addr| (ia.interface_name, ip))
         })
-        .filter_map(|(iname, ipv6)| {
-            interfaces()
-                .filter(|ia2| ia2.interface_name == iname)
-                .find_map(|ia2| {
-                    ia2.address
-                        .and_then(|addr| addr.as_sockaddr_in().map(|addr| addr.ip().into()))
-                        .map(|ip: std::net::Ipv4Addr| (iname.clone(), ip, ipv6))
-                })
-        })
-        .next()
         .ok_or_else(|| {
-            log::error!("Cannot find network interface suitable for mDNS broadcasting");
+            log::error!("Cannot find network interface with IPv4 for mDNS broadcasting");
             ErrorCode::StdIoError
         })?;
+
+    // Try to find an IPv6 address on the same interface; use unspecified as fallback
+    let ipv6 = interfaces()
+        .filter(|ia| ia.interface_name == iname)
+        .find_map(|ia| {
+            ia.address
+                .and_then(|addr| {
+                    addr.as_sockaddr_in6()
+                        .map(nix::sys::socket::SockaddrIn6::ip)
+                })
+        })
+        .unwrap_or(std::net::Ipv6Addr::UNSPECIFIED);
 
     log::info!("Will use network interface {iname} with {ip}/{ipv6} for mDNS");
 

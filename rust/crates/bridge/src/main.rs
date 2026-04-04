@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 mod config;
 mod mdns;
 mod onvif_bridge;
