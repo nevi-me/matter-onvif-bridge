@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/bridge",
+    "crates/matter-camera",
+    "crates/onvif-client",
+    "crates/media",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/user/matter-onvif-bridge"
+
+[workspace.dependencies]
+# Matter protocol
+rs-matter = { git = "https://github.com/project-chip/rs-matter", package = "rs-matter" }
+
+# ONVIF client
+oxvif = "0.7"
+
+# RTSP client (for future native WebRTC pipeline)
+retina = "0.4"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client (go2rtc API)
+reqwest = { version = "0.13", features = ["json"] }
+
+# WebSocket (go2rtc ICE trickle)
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Environment
+dotenvy = "0.15"
+
+# Internal crates
+matter-camera = { path = "crates/matter-camera" }
+onvif-client = { path = "crates/onvif-client" }
+media = { path = "crates/media" }
