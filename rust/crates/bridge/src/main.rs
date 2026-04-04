@@ -49,11 +49,9 @@ use rs_matter::dm::{InvokeContext, ReadContext};
 use rs_matter::tlv::{TLVBuilderParent, Utf8StrBuilder};
 use rs_matter::with;
 
-/// Camera device type (Matter 1.5 camera device)
-/// Using a placeholder device type ID — the actual camera device type
-/// will be finalized in the Matter 1.5 spec.
+/// Camera device type — Matter 1.5 Basic Video Camera (0x0103)
 const DEV_TYPE_CAMERA: DeviceType = DeviceType {
-    dtype: 0x0101, // Placeholder — will update when camera device type is ratified
+    dtype: 0x0103,
     drev: 1,
 };
 
@@ -79,8 +77,20 @@ fn main() -> Result<(), Error> {
         cfg.matter.discriminator
     );
 
-    // Device details — using test attestation for now
-    let dev_det = rs_matter::dm::devices::test::TEST_DEV_DET;
+    // Device details — using test attestation VID/PID but with real product info
+    let dev_det = rs_matter::dm::clusters::basic_info::BasicInfoConfig {
+        vid: 0xFFF1,  // Test vendor ID (required for test DAC attestation)
+        pid: 0x8001,  // Test product ID
+        product_name: "Matter-ONVIF Camera Bridge",
+        vendor_name: "matter-onvif-bridge",
+        device_name: "Camera Bridge",
+        serial_no: "MOBR-0001",
+        hw_ver: 1,
+        hw_ver_str: "1.0",
+        sw_ver: 1,
+        sw_ver_str: "0.1.0",
+        ..rs_matter::dm::clusters::basic_info::BasicInfoConfig::new()
+    };
     let matter = Matter::new_default(&dev_det, TEST_DEV_COMM, &TEST_DEV_ATT, cfg.matter.port);
     matter.initialize_transport_buffers()?;
 
