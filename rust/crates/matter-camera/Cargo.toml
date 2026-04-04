@@ -8,3 +8,4 @@ license.workspace = true
 rs-matter.workspace = true
 tracing.workspace = true
 serde.workspace = true
+strum = { version = "0.26", features = ["derive"] }
