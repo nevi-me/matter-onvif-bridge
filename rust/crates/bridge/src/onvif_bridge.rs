@@ -1,14 +1,20 @@
-//! Bridges ONVIF discovery to the Matter camera endpoint states.
+//! Bridges ONVIF discovery and go2rtc media to the Matter camera endpoint states.
 //!
-//! Runs the ONVIF discovery loop on a tokio runtime (separate thread)
-//! and populates the pre-allocated camera endpoint states with real data.
+//! Runs on a separate tokio runtime thread that:
+//! 1. Starts go2rtc manager (wait for readiness)
+//! 2. Runs ONVIF WS-Discovery loop
+//! 3. Feeds discovered cameras into the CameraRegistry
+//! 4. Registers RTSP streams in go2rtc via StreamManager
+//! 5. Populates pre-allocated camera endpoint states with real ONVIF data
+//! 6. Stores the go2rtc API and slot map for WebRTC command handling
 
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use matter_camera::types::{
-    CameraEndpointState, VideoResolution, VideoSensorParams,
-};
+use matter_camera::types::{CameraEndpointState, VideoResolution, VideoSensorParams};
+use media::go2rtc_api::Go2RtcApi;
+use media::go2rtc_manager::{Go2RtcManager, Go2RtcMode};
 use onvif_client::discovery::{DiscoveryConfig, DiscoveryEvent, DiscoveryMode};
 use onvif_client::registry::{CameraRegistry, RegistryEvent};
 use onvif_client::types::CameraDevice;
@@ -18,17 +24,34 @@ use crate::config::{self, Config};
 
 const MAX_CAMERAS: usize = 16;
 
-/// Start the ONVIF discovery bridge on a separate tokio runtime thread.
+/// Shared state accessible from the Matter handler thread for WebRTC negotiation.
+#[derive(Clone)]
+pub struct MediaBridge {
+    /// go2rtc API client for SDP exchange.
+    pub api: Go2RtcApi,
+    /// Maps camera ID → endpoint slot index (0-based, endpoint = slot + 2).
+    pub slot_map: Arc<RwLock<HashMap<String, usize>>>,
+    /// Maps endpoint slot index → stream name for go2rtc.
+    pub stream_names: Arc<RwLock<HashMap<usize, String>>>,
+}
+
+/// Start the ONVIF + go2rtc bridge on a separate tokio runtime thread.
 ///
-/// This spawns a background thread running tokio that:
-/// 1. Runs ONVIF WS-Discovery (or static-only) loop
-/// 2. Feeds discovered cameras into the CameraRegistry
-/// 3. Populates pre-allocated camera endpoint states with real ONVIF data
+/// Returns a `MediaBridge` that can be used by the Matter WebRTC handler
+/// to perform SDP negotiation via go2rtc.
 pub fn start_onvif_bridge(
     cfg: &Config,
     camera_states: &[Arc<RwLock<CameraEndpointState>>],
     registry: CameraRegistry,
-) {
+) -> MediaBridge {
+    let go2rtc_api = Go2RtcApi::new(&cfg.go2rtc.host, cfg.go2rtc.api_port);
+
+    let media_bridge = MediaBridge {
+        api: go2rtc_api.clone(),
+        slot_map: Arc::new(RwLock::new(HashMap::new())),
+        stream_names: Arc::new(RwLock::new(HashMap::new())),
+    };
+
     let discovery_config = DiscoveryConfig {
         username: cfg.onvif.username.clone(),
         password: cfg.onvif.password.clone(),
@@ -40,33 +63,63 @@ pub fn start_onvif_bridge(
         static_cameras: cfg.onvif.static_cameras.clone(),
     };
 
+    let go2rtc_mode = match cfg.go2rtc.mode {
+        config::Go2RtcMode::External => Go2RtcMode::External,
+        config::Go2RtcMode::Local => Go2RtcMode::Local,
+    };
+
+    let go2rtc_manager = Go2RtcManager::new(
+        &cfg.go2rtc.host,
+        cfg.go2rtc.api_port,
+        cfg.go2rtc.webrtc_port,
+        go2rtc_mode,
+        &cfg.go2rtc.path,
+    );
+
     let states = camera_states.to_vec();
     let registry_clone = registry.clone();
+    let bridge_clone = media_bridge.clone();
+    let onvif_username = cfg.onvif.username.clone();
+    let onvif_password = cfg.onvif.password.clone();
 
     std::thread::Builder::new()
-        .name("onvif-bridge".into())
+        .name("onvif-media-bridge".into())
         .spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .expect("Failed to create tokio runtime for ONVIF");
+                .expect("Failed to create tokio runtime");
 
             rt.block_on(async move {
-                let (discovery_tx, mut discovery_rx) = mpsc::channel(64);
+                // 1. Start go2rtc
+                if let Err(e) = go2rtc_manager.start().await {
+                    log::error!("Failed to start go2rtc: {e}");
+                    // Continue anyway — go2rtc may come up later
+                }
 
-                // Spawn discovery loop
+                // 2. Spawn stream manager (registers RTSP streams in go2rtc)
+                let api_for_streams = go2rtc_api.clone();
+                let registry_for_streams = registry_clone.clone();
+                tokio::spawn(async move {
+                    media::stream_manager::run_stream_manager(
+                        &registry_for_streams,
+                        api_for_streams,
+                        &onvif_username,
+                        &onvif_password,
+                    )
+                    .await;
+                });
+
+                // 3. Spawn ONVIF discovery
+                let (discovery_tx, mut discovery_rx) = mpsc::channel(64);
                 tokio::spawn(onvif_client::discovery::run_discovery(
                     discovery_config,
                     discovery_tx,
                 ));
 
-                // Subscribe to registry events for state population
+                // 4. Process discovery events → registry → state population
                 let mut registry_rx = registry_clone.subscribe();
-
-                // Process discovery events → registry, and registry events → state population
                 let mut next_slot: usize = 0;
-                let mut slot_map: std::collections::HashMap<String, usize> =
-                    std::collections::HashMap::new();
 
                 loop {
                     tokio::select! {
@@ -78,12 +131,7 @@ pub fn start_onvif_bridge(
                                 DiscoveryEvent::CameraLost(id) => {
                                     registry_clone.remove_camera(&id);
                                 }
-                                DiscoveryEvent::CameraUnreachable(id) => {
-                                    log::debug!("Camera {} unreachable", id);
-                                }
-                                DiscoveryEvent::Error(e) => {
-                                    log::error!("Discovery error: {}", e);
-                                }
+                                DiscoveryEvent::CameraUnreachable(_) | DiscoveryEvent::Error(_) => {}
                             }
                         }
                         Ok(event) = registry_rx.recv() => {
@@ -91,41 +139,51 @@ pub fn start_onvif_bridge(
                                 RegistryEvent::Added(camera) => {
                                     if next_slot < MAX_CAMERAS {
                                         let slot = next_slot;
-                                        slot_map.insert(camera.id.clone(), slot);
                                         next_slot += 1;
+
+                                        // Update slot maps
+                                        let stream_name = sanitize_stream_name(&camera.id);
+                                        if let Ok(mut map) = bridge_clone.slot_map.write() {
+                                            map.insert(camera.id.clone(), slot);
+                                        }
+                                        if let Ok(mut map) = bridge_clone.stream_names.write() {
+                                            map.insert(slot, stream_name);
+                                        }
+
                                         populate_camera_state(&states[slot], &camera);
                                         log::info!(
-                                            "Camera '{}' ({}) assigned to endpoint {}",
+                                            "Camera '{}' ({}) → endpoint {}, stream registered",
                                             camera.device_info.model,
                                             camera.id,
-                                            slot + 2, // ep 2..17
+                                            slot + 2,
                                         );
                                     } else {
                                         log::warn!(
-                                            "No more endpoint slots for camera {} (max {})",
+                                            "No endpoint slots left for camera {} (max {})",
                                             camera.id,
                                             MAX_CAMERAS
                                         );
                                     }
                                 }
                                 RegistryEvent::Updated(camera) => {
-                                    if let Some(&slot) = slot_map.get(&camera.id) {
-                                        populate_camera_state(&states[slot], &camera);
+                                    if let Ok(map) = bridge_clone.slot_map.read() {
+                                        if let Some(&slot) = map.get(&camera.id) {
+                                            populate_camera_state(&states[slot], &camera);
+                                        }
                                     }
                                 }
                                 RegistryEvent::Removed(id) => {
-                                    if let Some(&slot) = slot_map.get(&id) {
-                                        // Reset endpoint state to defaults
-                                        if let Ok(mut state) = states[slot].write() {
-                                            *state = CameraEndpointState::default();
+                                    if let Ok(mut map) = bridge_clone.slot_map.write() {
+                                        if let Some(slot) = map.remove(&id) {
+                                            if let Ok(mut state) = states[slot].write() {
+                                                *state = CameraEndpointState::default();
+                                            }
+                                            if let Ok(mut names) = bridge_clone.stream_names.write() {
+                                                names.remove(&slot);
+                                            }
+                                            log::info!("Camera {} removed from endpoint {}", id, slot + 2);
                                         }
-                                        log::info!(
-                                            "Camera {} removed from endpoint {}",
-                                            id,
-                                            slot + 2,
-                                        );
                                     }
-                                    slot_map.remove(&id);
                                 }
                             }
                         }
@@ -133,20 +191,18 @@ pub fn start_onvif_bridge(
                 }
             });
         })
-        .expect("Failed to spawn ONVIF bridge thread");
+        .expect("Failed to spawn ONVIF/media bridge thread");
+
+    media_bridge
 }
 
 /// Populate a camera endpoint's cluster state from ONVIF device data.
-fn populate_camera_state(
-    state_lock: &Arc<RwLock<CameraEndpointState>>,
-    camera: &CameraDevice,
-) {
+fn populate_camera_state(state_lock: &Arc<RwLock<CameraEndpointState>>, camera: &CameraDevice) {
     let Ok(mut state) = state_lock.write() else {
         log::error!("Failed to lock camera state for writing");
         return;
     };
 
-    // Extract video params from the first profile
     if let Some(profile) = camera.profiles.first() {
         if let Some(ve) = &profile.video_encoder {
             state.video_sensor_params = VideoSensorParams {
@@ -166,5 +222,18 @@ fn populate_camera_state(
     }
 
     state.max_concurrent_video_encoders = camera.profiles.len().max(1) as u8;
-    state.max_network_bandwidth = 10_000; // Default 10 Mbps
+    state.max_network_bandwidth = 10_000;
+}
+
+/// Sanitize camera ID into a go2rtc-compatible stream name.
+fn sanitize_stream_name(id: &str) -> String {
+    id.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }

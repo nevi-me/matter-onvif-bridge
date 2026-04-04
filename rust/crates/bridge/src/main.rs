@@ -98,12 +98,46 @@ fn main() -> Result<(), Error> {
         .iter()
         .map(|s| AvStreamHandler::new(Dataver::new_rand(&mut rand), Arc::clone(s)))
         .collect();
-    let webrtc_handlers: Vec<WebRtcHandler> = camera_states
+    let mut webrtc_handlers: Vec<WebRtcHandler> = camera_states
         .iter()
         .map(|s| WebRtcHandler::new(Dataver::new_rand(&mut rand), Arc::clone(s)))
         .collect();
 
-    // Build the data model handler
+    // Start ONVIF + go2rtc bridge on a separate tokio thread
+    let registry = onvif_client::registry::CameraRegistry::new(64);
+    let media_bridge = onvif_bridge::start_onvif_bridge(&cfg, &camera_states, registry);
+
+    // Wire SDP exchange callbacks into WebRTC handlers BEFORE building the data model.
+    // Each handler gets a closure that looks up its stream name and calls go2rtc.
+    for (i, handler) in webrtc_handlers.iter_mut().enumerate() {
+        let api = media_bridge.api.clone();
+        let stream_names = media_bridge.stream_names.clone();
+
+        handler.set_sdp_exchange(Box::new(move |sdp_offer: &str| {
+            let stream_name = {
+                let names = stream_names.read().map_err(|e| format!("Lock error: {e}"))?;
+                names.get(&i).cloned().ok_or_else(|| {
+                    format!("No stream registered for endpoint slot {i}")
+                })?
+            };
+
+            // Run the async SDP exchange on a one-shot tokio runtime
+            // (we're on the Matter executor thread, not a tokio context)
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("Failed to create tokio runtime: {e}"))?;
+
+            let api = api.clone();
+            rt.block_on(async {
+                let session = media::webrtc_session::WebRtcSession::new(stream_name, api);
+                let result = session.negotiate(sdp_offer).await?;
+                Ok((result.sdp_answer, result.ice_candidates))
+            })
+        }));
+    }
+
+    // Build the data model handler (borrows handlers immutably from here on)
     let dm = DataModel::new(
         &matter,
         &crypto,
@@ -128,12 +162,6 @@ fn main() -> Result<(), Error> {
 
     let mut psm: Psm<4096> = Psm::new();
     let path = std::path::PathBuf::from(&cfg.matter.storage_path);
-
-    psm.load(&path, &matter, NO_NETWORKS, Some(&events))?;
-
-    // Start ONVIF discovery bridge on a separate tokio thread
-    let registry = onvif_client::registry::CameraRegistry::new(64);
-    onvif_bridge::start_onvif_bridge(&cfg, &camera_states, registry);
 
     if !matter.is_commissioned() {
         log::info!("Device not commissioned. Displaying QR code...");

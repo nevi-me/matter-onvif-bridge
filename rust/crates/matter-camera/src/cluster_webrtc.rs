@@ -66,16 +66,35 @@ pub const WEBRTC_CLUSTER: Cluster<'static> = Cluster::new(
     |_, _, _| true,
 );
 
+// ── SDP exchange callback ──
+
+/// Callback type for SDP offer/answer exchange.
+/// Takes an SDP offer string, returns (sdp_answer, ice_candidates).
+/// This is called synchronously from the Matter handler thread.
+pub type SdpExchangeFn = Box<dyn Fn(&str) -> Result<(String, Vec<String>), String> + Send + Sync>;
+
 // ── Handler ──
 
 pub struct WebRtcHandler {
     dataver: Dataver,
     state: Arc<RwLock<CameraEndpointState>>,
+    /// Optional SDP exchange callback — when None, returns a stub SDP answer.
+    /// Set by the bridge after go2rtc is wired up.
+    sdp_exchange: Option<SdpExchangeFn>,
 }
 
 impl WebRtcHandler {
     pub fn new(dataver: Dataver, state: Arc<RwLock<CameraEndpointState>>) -> Self {
-        Self { dataver, state }
+        Self {
+            dataver,
+            state,
+            sdp_exchange: None,
+        }
+    }
+
+    /// Set the SDP exchange callback for real go2rtc integration.
+    pub fn set_sdp_exchange(&mut self, f: SdpExchangeFn) {
+        self.sdp_exchange = Some(f);
     }
 }
 
@@ -133,11 +152,30 @@ impl Handler for WebRtcHandler {
                 let session_id = state.next_session_id;
                 state.next_session_id += 1;
 
-                debug!(
-                    session_id,
-                    sdp_offer_len = sdp_offer.len(),
-                    "ProvideOffer (stub — returning empty SDP answer)"
-                );
+                // Exchange SDP via go2rtc if available, otherwise return stub
+                let sdp_answer = if let Some(ref exchange) = self.sdp_exchange {
+                    match exchange(sdp_offer) {
+                        Ok((answer, _candidates)) => {
+                            debug!(
+                                session_id,
+                                sdp_answer_len = answer.len(),
+                                "ProvideOffer — SDP exchanged via go2rtc"
+                            );
+                            answer
+                        }
+                        Err(e) => {
+                            debug!(
+                                session_id,
+                                err = %e,
+                                "ProvideOffer — go2rtc SDP exchange failed, returning stub"
+                            );
+                            "v=0\r\n".to_string()
+                        }
+                    }
+                } else {
+                    debug!(session_id, "ProvideOffer — no SDP exchanger, returning stub");
+                    "v=0\r\n".to_string()
+                };
 
                 state.current_sessions.push(crate::types::WebRtcSession {
                     id: session_id,
@@ -160,7 +198,7 @@ impl Handler for WebRtcHandler {
                 let mut tw = writer.writer();
                 tw.start_struct(&tag)?;
                 tw.u16(&TLVTag::Context(0), session_id)?;
-                tw.utf8(&TLVTag::Context(1), "v=0\r\n")?; // Stub SDP answer
+                tw.utf8(&TLVTag::Context(1), &sdp_answer)?;
                 tw.end_container()?;
                 drop(tw);
                 writer.complete()
