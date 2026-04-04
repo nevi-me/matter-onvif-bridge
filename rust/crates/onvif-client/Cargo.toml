@@ -9,3 +9,4 @@ oxvif.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 serde.workspace = true
+url = "2"

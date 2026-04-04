@@ -2035,6 +2035,7 @@ dependencies = [
  "serde",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

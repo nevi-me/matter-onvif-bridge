@@ -1,5 +1,6 @@
 mod config;
 mod mdns;
+mod onvif_bridge;
 
 use core::pin::pin;
 use std::net::UdpSocket;
@@ -129,6 +130,10 @@ fn main() -> Result<(), Error> {
     let path = std::path::PathBuf::from(&cfg.matter.storage_path);
 
     psm.load(&path, &matter, NO_NETWORKS, Some(&events))?;
+
+    // Start ONVIF discovery bridge on a separate tokio thread
+    let registry = onvif_client::registry::CameraRegistry::new(64);
+    onvif_bridge::start_onvif_bridge(&cfg, &camera_states, registry);
 
     if !matter.is_commissioned() {
         log::info!("Device not commissioned. Displaying QR code...");
