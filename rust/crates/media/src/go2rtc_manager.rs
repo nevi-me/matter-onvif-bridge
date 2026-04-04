@@ -95,13 +95,14 @@ impl Go2RtcManager {
         std::fs::write(&config_path, config)
             .map_err(|e| format!("Failed to write go2rtc config: {e}"))?;
 
+        let binary_path = self.binary_path.clone();
         let config_path_str = config_path.to_string_lossy().to_string();
 
         // Spawn in background
         tokio::spawn(async move {
             loop {
-                info!("Spawning go2rtc process...");
-                let result = Command::new(&config_path_str)
+                info!("Spawning go2rtc process: {}", binary_path);
+                let result = Command::new(&binary_path)
                     .arg("-config")
                     .arg(&config_path_str)
                     .kill_on_drop(true)
