@@ -17,7 +17,7 @@ repository = "https://github.com/user/matter-onvif-bridge"
 rs-matter = { git = "https://github.com/project-chip/rs-matter", package = "rs-matter" }
 
 # ONVIF client
-oxvif = "0.7"
+oxvif = "0.8"
 
 # RTSP client (for future native WebRTC pipeline)
 retina = "0.4"
