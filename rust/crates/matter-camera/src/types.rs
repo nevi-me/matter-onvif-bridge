@@ -79,13 +79,13 @@ pub struct VideoResolution {
     pub height: u16,
 }
 
-/// VideoSensorParamsStruct
+/// VideoSensorParamsStruct (Matter 1.5.0.1)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VideoSensorParams {
     pub sensor_width: u16,
     pub sensor_height: u16,
-    pub hdr_capable: bool,
     pub max_fps: u16,
+    pub max_hdr_fps: Option<u16>,
 }
 
 /// AudioCapabilitiesStruct
@@ -103,7 +103,7 @@ pub struct SnapshotParams {
     pub image_codec: VideoCodec,
 }
 
-/// VideoStreamStruct — allocated video stream
+/// VideoStreamStruct — allocated video stream (Matter 1.5.0.1)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VideoStream {
     pub video_stream_id: u16,
@@ -115,8 +115,7 @@ pub struct VideoStream {
     pub max_resolution: VideoResolution,
     pub min_bit_rate: u32,
     pub max_bit_rate: u32,
-    pub min_fragment_len: u16,
-    pub max_fragment_len: u16,
+    pub key_frame_interval: u16,
     pub reference_count: Option<u8>,
 }
 
@@ -193,13 +192,8 @@ pub struct CameraEndpointState {
     pub max_concurrent_video_encoders: u8,
     pub max_encoded_pixel_rate: u32,
     pub video_sensor_params: VideoSensorParams,
-    pub night_vision_capable: bool,
     pub min_viewport: VideoResolution,
-    pub microphone_capabilities: Vec<AudioCapabilities>,
-    pub speaker_capabilities: Vec<AudioCapabilities>,
     pub two_way_talk_support: TwoWayTalkSupport,
-    pub supported_snapshot_params: Vec<SnapshotParams>,
-    pub hdr_capable: bool,
     pub max_network_bandwidth: u32,
     pub current_frame_rate: u16,
     pub allocated_video_streams: Vec<VideoStream>,
@@ -211,9 +205,6 @@ pub struct CameraEndpointState {
     pub hard_privacy_mode_on: bool,
     pub night_vision: TriStateAuto,
     pub night_vision_illum: TriStateAuto,
-    pub awb_enabled: bool,
-    pub auto_shutter_speed_enabled: bool,
-    pub auto_iso_enabled: bool,
     pub viewport: VideoResolution,
 
     // Stream ID counters
@@ -242,19 +233,14 @@ impl Default for CameraEndpointState {
             video_sensor_params: VideoSensorParams {
                 sensor_width: 1920,
                 sensor_height: 1080,
-                hdr_capable: false,
                 max_fps: 30,
+                max_hdr_fps: None,
             },
-            night_vision_capable: false,
             min_viewport: VideoResolution {
                 width: 320,
                 height: 240,
             },
-            microphone_capabilities: Vec::new(),
-            speaker_capabilities: Vec::new(),
             two_way_talk_support: TwoWayTalkSupport::NotSupported,
-            supported_snapshot_params: Vec::new(),
-            hdr_capable: false,
             max_network_bandwidth: 10_000,
             current_frame_rate: 30,
             allocated_video_streams: Vec::new(),
@@ -266,9 +252,6 @@ impl Default for CameraEndpointState {
             hard_privacy_mode_on: false,
             night_vision: TriStateAuto::Off,
             night_vision_illum: TriStateAuto::Off,
-            awb_enabled: true,
-            auto_shutter_speed_enabled: true,
-            auto_iso_enabled: true,
             viewport: VideoResolution {
                 width: 1920,
                 height: 1080,

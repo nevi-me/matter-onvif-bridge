@@ -228,7 +228,7 @@ fn populate_camera_state(state_lock: &Arc<RwLock<CameraEndpointState>>, camera: 
             state.video_sensor_params = VideoSensorParams {
                 sensor_width: ve.width,
                 sensor_height: ve.height,
-                hdr_capable: false,
+                max_hdr_fps: None,
                 max_fps: ve.frame_rate,
             };
             state.viewport = VideoResolution {
