@@ -1,13 +1,13 @@
 # Matter-ONVIF Bridge — Docker Compose
 #
 # This runs ONLY go2rtc in Docker (RTSP→WebRTC media bridging).
-# The Node.js bridge runs natively because it needs LAN multicast for:
+# The Rust bridge runs natively because it needs LAN multicast for:
 #   - ONVIF WS-Discovery (UDP 239.255.255.250:3702)
 #   - Matter mDNS commissioning (UDP 224.0.0.251:5353)
 #
 # Usage:
-#   docker compose up -d        # Start go2rtc
-#   pnpm dev                     # Start bridge natively (separate terminal)
+#   docker compose up -d                    # Start go2rtc
+#   cargo run -p matter-onvif-bridge        # Start bridge (separate terminal)
 
 services:
   go2rtc:

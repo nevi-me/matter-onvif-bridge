@@ -1,197 +1,103 @@
-# Matter-ONVIF Bridge
+# Matter-ONVIF Camera Bridge
 
-A Matter bridge that discovers ONVIF IP cameras on your local network and exposes them as Matter camera devices. Uses [matter.js](https://github.com/matter-js/matter.js) for the Matter protocol and [go2rtc](https://github.com/AlexxIT/go2rtc) for RTSP-to-WebRTC media bridging.
+A Rust bridge that discovers ONVIF IP cameras and exposes them as Matter camera devices. Uses [rs-matter](https://github.com/project-chip/rs-matter) for the Matter protocol, [oxvif](https://github.com/smiti1642/oxvif) for ONVIF discovery/control, and [go2rtc](https://github.com/AlexxIT/go2rtc) for RTSP-to-WebRTC media bridging.
 
-## Architecture
+## Features
 
-```
-ONVIF Cameras <--RTSP/SOAP--> [ONVIF Client] --> [Camera Registry]
-                                                        |
-Matter Controllers <--Matter--> [Matter Bridge (AggregatorEndpoint)]
-       |                                |
-       +------WebRTC (P2P)-----> [go2rtc] <--RTSP--> ONVIF Cameras
-```
-
-- **go2rtc** runs in Docker — handles RTSP ingestion and WebRTC streaming with H.264 passthrough (no transcoding)
-- **Node.js bridge** runs natively — needs LAN access for ONVIF WS-Discovery (UDP multicast) and Matter mDNS commissioning
-
-## Prerequisites
-
-- Node.js 20+
-- pnpm (`npm install -g pnpm`)
-- Docker and Docker Compose
-- ONVIF-compatible IP cameras on your network
+- **Matter 1.5 camera clusters** — CameraAvStreamManagement (0x0551) and WebRTCTransportProvider (0x0553)
+- **ONVIF discovery** — WS-Discovery + static camera list, with miss-threshold grace period
+- **WebRTC streaming** — SDP exchange via go2rtc for H.264/H.265 passthrough
+- **Bridge architecture** — up to 16 cameras exposed as bridged Matter endpoints
+- **Small footprint** — ~10MB binary, ~20MB runtime on Raspberry Pi
 
 ## Quick Start
 
 ```bash
-# Install dependencies
-pnpm install
-
-# Copy and edit environment config
+# 1. Copy .env.example and configure
 cp .env.example .env
 # Edit .env with your ONVIF camera credentials
 
-# Start go2rtc in Docker
+# 2. Start go2rtc (for media bridging)
 docker compose up -d
 
-# Build and run the bridge
-pnpm build
-pnpm start
+# 3. Run the bridge
+cargo run -p matter-onvif-bridge
+
+# 4. Commission with chip-tool or scan the QR code with Google Home
+chip-tool pairing onnetwork 2 20202021
 ```
 
-On startup, the bridge will display a commissioning banner:
+## Cross-Compile for Raspberry Pi
 
-```
-╔══════════════════════════════════════════════╗
-║  Matter ONVIF Camera Bridge                  ║
-║                                              ║
-║  Manual pairing code: 34970112332      ║
-║  Passcode:            20202021          ║
-║  Discriminator:       3840              ║
-║  Port:                5540              ║
-╚══════════════════════════════════════════════╝
-```
-
-## Commissioning
-
-The bridge commissions over IP (no Bluetooth required). It advertises via mDNS on your local network.
-
-**Apple Home** (iPhone/iPad):
-1. Open Home app → **+** → **Add Accessory** → **More options...**
-2. The bridge should appear as "ONVIF Camera Bridge"
-3. Enter the setup code displayed in the banner
-
-**Google Home** (Android/iPhone):
-1. Open Google Home → **+** → **Set up device** → **New device** → **Matter**
-2. Enter the pairing code from the banner
-
-**Home Assistant**:
-1. Go to **Settings** → **Devices & Services** → **Add Integration** → **Matter**
-2. Select **Commission device** and enter the pairing code
-3. HA and the bridge must be on the same network/VLAN
-
-**chip-tool** (command line):
 ```bash
-chip-tool pairing onnetwork 1 20202021
+# Install cross (Docker-based cross-compilation)
+cargo install cross --git https://github.com/cross-rs/cross
+
+# Build for aarch64
+cross build --release --target aarch64-unknown-linux-gnu -p matter-onvif-bridge
+
+# Deploy
+scp target/aarch64-unknown-linux-gnu/release/matter-onvif-bridge pi@<host>:~/
 ```
 
-> **Note:** Matter 1.5 camera support is new (November 2024). Controllers may not yet fully support the camera clusters (CameraAvStreamManagement, WebRtcTransportProvider). The bridge will commission and appear as a device, but live video streaming depends on controller support.
+## Test ONVIF Connectivity
+
+```bash
+# Reads cameras from .env, tests WS-Discovery and direct connections
+cargo run -p onvif-client --example test_connect
+```
 
 ## Configuration
 
-All configuration is via environment variables in `.env`:
+All configuration is via environment variables (`.env` file):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ONVIF_USERNAME` | `admin` | ONVIF camera username |
-| `ONVIF_PASSWORD` | `admin` | ONVIF camera password |
-| `ONVIF_DISCOVERY_INTERVAL` | `60000` | Discovery scan interval (ms) |
-| `ONVIF_STATIC_CAMERAS` | | Comma-separated list of `host:port` for cameras that may not respond to WS-Discovery |
+| `ONVIF_USERNAME` | `admin` | ONVIF camera credentials |
+| `ONVIF_PASSWORD` | `admin` | ONVIF camera credentials |
+| `ONVIF_DISCOVERY_MODE` | `auto` | `auto` (WS-Discovery + static) or `static` |
+| `ONVIF_DISCOVERY_INTERVAL` | `60000` | Rescan interval in ms |
+| `ONVIF_STATIC_CAMERAS` | | Comma-separated `host:port` list |
 | `GO2RTC_MODE` | `external` | `external` (Docker) or `local` (subprocess) |
-| `GO2RTC_HOST` | `localhost` | Hostname where go2rtc API is reachable |
+| `GO2RTC_PATH` | `./bin/go2rtc` | Binary path for local mode |
+| `GO2RTC_HOST` | `localhost` | go2rtc API host |
 | `GO2RTC_API_PORT` | `1984` | go2rtc REST API port |
 | `GO2RTC_WEBRTC_PORT` | `8555` | go2rtc WebRTC port |
 | `MATTER_PORT` | `5540` | Matter protocol port |
 | `MATTER_PASSCODE` | `20202021` | Commissioning passcode |
 | `MATTER_DISCRIMINATOR` | `3840` | Commissioning discriminator |
-| `LOG_LEVEL` | `info` | Log level: trace, debug, info, warn, error, fatal |
+| `MATTER_STORAGE_PATH` | `.matter-storage` | Persistent state directory |
 
-### Static cameras
-
-If your cameras use non-standard ONVIF ports or multicast discovery is unreliable, list them explicitly:
-
-```env
-ONVIF_STATIC_CAMERAS=192.168.1.10:2020,192.168.1.11:80,192.168.1.12:2020
-```
-
-## Development
-
-```bash
-# Run in development mode (auto-recompile)
-pnpm dev
-
-# Type check
-pnpm exec tsc --noEmit
-
-# Run tests
-pnpm test
-
-# View go2rtc logs
-pnpm go2rtc:logs
-
-# Start both go2rtc and bridge
-pnpm up
-```
-
-### Project Structure
+## Architecture
 
 ```
-src/
-  index.ts                          # Entry point
-  config.ts                         # Environment config
-  logger.ts                         # Pino logger
-  onvif/
-    discovery.ts                    # WS-Discovery + static camera list
-    client.ts                       # Per-camera ONVIF client
-    types.ts                        # Interfaces
-  registry/
-    camera-registry.ts              # Discovered camera store
-    camera.ts                       # CameraDevice model
-  media/
-    go2rtc-manager.ts               # go2rtc lifecycle (Docker or subprocess)
-    go2rtc-api.ts                   # REST/WebSocket client for go2rtc
-    stream-manager.ts               # RTSP stream registration
-    webrtc-session.ts               # WebRTC SDP/ICE session
-  matter/
-    bridge.ts                       # ServerNode + AggregatorEndpoint
-    clusters/
-      camera-av-stream-management/  # Cluster 0x0551 (Matter 1.5)
-      webrtc-transport-provider/    # Cluster 0x0553 (Matter 1.5)
+ONVIF Cameras (RTSP + SOAP)
+    ↓
+[oxvif WS-Discovery + Client] ← discovers cameras, fetches device info
+    ↓
+[CameraRegistry] ← broadcast events (Added/Removed)
+    ↓
+├→ [StreamManager] → registers RTSP streams in go2rtc
+├→ [MatterBridge] → populates BridgedNodeEndpoints
+│   ├→ CameraAvStreamManagement (0x0551)
+│   └→ WebRtcTransportProvider (0x0553)
+│       └→ ProvideOffer → go2rtc SDP exchange → WebRTC stream
+│
+Matter Controllers (Google Home, chip-tool)
+    ↓
+[rs-matter] ← mDNS discovery, PASE commissioning, CASE sessions
 ```
 
-## Raspberry Pi Deployment
+## Workspace Structure
 
-### Quick setup
-
-```bash
-# Copy the project to your Pi
-scp -r . pi@<pi-ip>:/opt/matter-onvif-bridge/
-
-# Run the setup script (installs Node.js, pnpm, go2rtc, creates systemd service)
-sudo bash /opt/matter-onvif-bridge/scripts/setup-pi.sh
-
-# Edit your credentials
-nano /opt/matter-onvif-bridge/.env
-
-# Start the service
-sudo systemctl start matter-onvif-bridge
-
-# View logs
-journalctl -u matter-onvif-bridge -f
 ```
-
-The service auto-starts on boot and restarts on failure.
-
-### Requirements
-
-- Raspberry Pi 4 or 5, 2GB+ RAM
-- Raspberry Pi OS (64-bit recommended)
-- Wired Ethernet recommended (for reliable multicast)
-- ~80-110MB RAM usage (Node.js + go2rtc)
-
-### go2rtc on Pi
-
-On the Pi, you can either:
-- Use Docker (keep `GO2RTC_MODE=external` and run `docker compose up -d`)
-- Run go2rtc natively (set `GO2RTC_MODE=local` in `.env` and run `bash scripts/install-go2rtc.sh`)
-
-## Known Issues
-
-- **TP-Link VIGI cameras**: Some VIGI firmware versions have intermittent ONVIF connection failures. The bridge includes `preserveAddress: true` as a workaround, but connections may still be flaky. Cameras will connect on subsequent scan cycles.
-- **Matter 1.5 controller support**: Camera clusters are new. Apple Home, Google Home, and other controllers may not yet support viewing Matter camera streams.
-- **Snapshot capture**: Not yet implemented.
+crates/
+  bridge/          # Main binary — Matter bridge + ONVIF + go2rtc wiring
+  matter-camera/   # Custom Matter cluster implementations (0x0551, 0x0553)
+  onvif-client/    # ONVIF discovery, client, and camera registry
+  media/           # go2rtc API client, stream manager, WebRTC sessions
+```
 
 ## License
 
-Apache-2.0
+MIT

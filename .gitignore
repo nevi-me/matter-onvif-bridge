@@ -1,8 +1,19 @@
-node_modules/
-dist/
+# Rust
+/target
+
+# Environment
 .env
 .matter-storage/
-bin/
-*.tgz
+
+# go2rtc
 go2rtc.yaml
+bin/
+
+# OS
+.DS_Store
+
+# Legacy TypeScript (removed)
+node_modules/
+dist/
+*.tgz
 package-lock.json

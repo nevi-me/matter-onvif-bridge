@@ -9,10 +9,9 @@ use std::time::Duration;
 
 #[tokio::main]
 async fn main() {
-    // Load .env from workspace root (rust/../.env)
-    // CARGO_MANIFEST_DIR = rust/crates/onvif-client, .env is at repo root
+    // CARGO_MANIFEST_DIR = crates/onvif-client, .env is at repo root
     let env_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../.env");
+        .join("../../.env");
     match dotenvy::from_path(&env_path) {
         Ok(_) => println!("Loaded {}", env_path.display()),
         Err(e) => println!("Warning: could not load {}: {e}", env_path.display()),

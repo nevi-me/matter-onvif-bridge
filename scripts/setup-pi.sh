@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Setup script for Raspberry Pi deployment
+# Setup script for Raspberry Pi deployment (Rust binary)
 # Installs the matter-onvif-bridge as a systemd service
 
 INSTALL_DIR="${1:-/opt/matter-onvif-bridge}"
@@ -12,37 +12,14 @@ echo "=== Matter-ONVIF Bridge Pi Setup ==="
 echo "Install dir: $INSTALL_DIR"
 echo "Service user: $SERVICE_USER"
 
-# Check if running as root
 if [ "$EUID" -ne 0 ]; then
   echo "Please run as root (sudo)"
   exit 1
 fi
 
-# Install Node.js 20 if not present
-if ! command -v node &>/dev/null || [ "$(node -v | cut -d. -f1 | tr -d v)" -lt 20 ]; then
-  echo "Installing Node.js 20..."
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-  apt-get install -y nodejs
-fi
-
-echo "Node.js version: $(node -v)"
-
-# Install pnpm if not present
-if ! command -v pnpm &>/dev/null; then
-  echo "Installing pnpm..."
-  npm install -g pnpm
-fi
-
-echo "pnpm version: $(pnpm -v)"
-
 # Install go2rtc
 echo "Installing go2rtc..."
 bash "$INSTALL_DIR/scripts/install-go2rtc.sh"
-
-# Install dependencies and build
-cd "$INSTALL_DIR"
-pnpm install --frozen-lockfile
-pnpm run build
 
 # Create .env if it doesn't exist
 if [ ! -f "$INSTALL_DIR/.env" ]; then
@@ -64,10 +41,10 @@ Wants=network-online.target
 Type=simple
 User=$SERVICE_USER
 WorkingDirectory=$INSTALL_DIR
-ExecStart=/usr/bin/node $INSTALL_DIR/dist/index.js
+ExecStart=$INSTALL_DIR/matter-onvif-bridge
 Restart=always
 RestartSec=5
-Environment=NODE_ENV=production
+Environment=RUST_LOG=info
 
 [Install]
 WantedBy=multi-user.target
@@ -78,7 +55,8 @@ systemctl enable "$SERVICE_NAME"
 
 echo ""
 echo "=== Setup Complete ==="
-echo "1. Edit $INSTALL_DIR/.env with your ONVIF camera credentials"
-echo "2. Start the service: sudo systemctl start $SERVICE_NAME"
-echo "3. View logs: journalctl -u $SERVICE_NAME -f"
-echo "4. On first run, scan the QR code with your Matter controller to commission"
+echo "1. Copy the cross-compiled binary to $INSTALL_DIR/matter-onvif-bridge"
+echo "2. Edit $INSTALL_DIR/.env with your ONVIF camera credentials"
+echo "3. Start the service: sudo systemctl start $SERVICE_NAME"
+echo "4. View logs: journalctl -u $SERVICE_NAME -f"
+echo "5. On first run, scan the QR code with your Matter controller to commission"
