@@ -40,6 +40,112 @@ cross build --release --target aarch64-unknown-linux-gnu -p matter-onvif-bridge
 scp target/aarch64-unknown-linux-gnu/release/matter-onvif-bridge pi@<host>:~/
 ```
 
+## Deploy to a Linux Machine
+
+### Option A: Cross-compile from Mac and copy
+
+```bash
+# On your Mac (one-time setup)
+cargo install cross --git https://github.com/cross-rs/cross
+
+# Build for the target architecture
+cross build --release --target aarch64-unknown-linux-gnu -p matter-onvif-bridge
+
+# Copy binary, config, and go2rtc installer to the target
+scp target/aarch64-unknown-linux-gnu/release/matter-onvif-bridge <user>@<host>:~/matter-onvif-bridge/
+scp .env.example scripts/install-go2rtc.sh <user>@<host>:~/matter-onvif-bridge/
+```
+
+Then on the Linux machine:
+```bash
+cd ~/matter-onvif-bridge
+
+# Install go2rtc
+bash install-go2rtc.sh        # downloads to ./bin/go2rtc
+
+# Configure
+cp .env.example .env
+nano .env                      # set ONVIF credentials, GO2RTC_MODE=local, etc.
+
+# Run
+RUST_LOG=info ./matter-onvif-bridge
+```
+
+### Option B: Build natively on the Linux machine
+
+```bash
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source ~/.cargo/env
+
+# Install build dependencies (Ubuntu/Debian)
+sudo apt install -y build-essential pkg-config libdbus-1-dev
+
+# Clone and build
+git clone <repo-url> matter-onvif-bridge
+cd matter-onvif-bridge
+cargo build --release -p matter-onvif-bridge
+
+# Install go2rtc
+bash scripts/install-go2rtc.sh
+
+# Configure and run
+cp .env.example .env
+nano .env
+RUST_LOG=info ./target/release/matter-onvif-bridge
+```
+
+### Run as a systemd service
+
+```bash
+sudo tee /etc/systemd/system/matter-onvif-bridge.service <<EOF
+[Unit]
+Description=Matter-ONVIF Camera Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$USER
+WorkingDirectory=$HOME/matter-onvif-bridge
+ExecStart=$HOME/matter-onvif-bridge/matter-onvif-bridge
+Restart=always
+RestartSec=5
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now matter-onvif-bridge
+
+# View logs
+journalctl -u matter-onvif-bridge -f
+```
+
+### Network requirements
+
+The bridge needs direct LAN access (not Docker) for:
+- **UDP 5353** — mDNS for Matter commissioning
+- **UDP 3702** — ONVIF WS-Discovery multicast
+- **UDP 5540** — Matter protocol (configurable via `MATTER_PORT`)
+- **TCP to cameras** — ONVIF SOAP (typically port 80 or 2020)
+- **IPv6 enabled** — Matter controllers use IPv6 for commissioning (`sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0`)
+
+### First-time commissioning
+
+On first run the bridge prints a QR code and pairing code:
+```
+SetupQRCode: [MT:-24J0AFN00KA064IJ3P0...]
+PairingCode: [3497-0112-332]
+```
+
+Commission with any Matter controller:
+- **chip-tool**: `chip-tool pairing onnetwork 2 20202021`
+- **Google Home**: Add device → Matter → Enter pairing code
+- **Apple Home**: Scan QR code
+
 ## Test ONVIF Connectivity
 
 ```bash
