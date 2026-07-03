@@ -47,6 +47,7 @@ pub async fn connect_camera(
         .ok_or("No media service URL in capabilities")?;
 
     let events_url = caps.events.url.clone();
+    let supports_ptz = caps.ptz.url.is_some();
 
     // Probe motion-event support: query the Events service for its topic set
     // and look for any topic ending in `MotionAlarm`. We don't fail the connect
@@ -185,5 +186,6 @@ pub async fn connect_camera(
         stream_uri,
         events_url,
         supports_motion,
+        supports_ptz,
     })
 }

@@ -21,6 +21,8 @@ pub struct CameraDevice {
     pub events_url: Option<String>,
     /// True if the device's event TopicSet contains a `MotionAlarm` topic.
     pub supports_motion: bool,
+    /// True if the device advertises a PTZ service URL in GetCapabilities.
+    pub supports_ptz: bool,
 }
 
 /// ONVIF device information.

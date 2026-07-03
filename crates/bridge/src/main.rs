@@ -1,6 +1,7 @@
 #![recursion_limit = "2048"]
 
 mod config;
+mod hooks;
 mod mdns;
 mod onvif_bridge;
 mod slot_persistence;
@@ -10,10 +11,15 @@ use std::net::UdpSocket;
 use std::sync::Arc;
 use std::sync::RwLock;
 
-use embassy_futures::select::select4;
+use embassy_futures::select::{select, select4, Either};
 use rand::RngCore;
 
 use rs_matter::crypto::{default_crypto, Crypto};
+use rs_matter::dm::clusters::app::cam_av_stream::{
+    self, CameraAvStreamConfig, CameraAvStreamHandler, Feature as CamAvFeature,
+    RateDistortionPoint, StreamUsageEnum, VideoCodecEnum, VideoSensorParams,
+};
+use rs_matter::dm::clusters::app::webrtc_prov::{self, WebRtcProvHandler};
 use rs_matter::dm::clusters::desc::{self, ClusterHandler as _};
 use rs_matter::dm::clusters::groups::{self, ClusterHandler as _};
 use rs_matter::dm::clusters::net_comm::SharedNetworks;
@@ -40,10 +46,7 @@ use rs_matter::utils::select::Coalesce;
 use rs_matter::utils::storage::pooled::PooledBuffers;
 use rs_matter::{clusters, devices, root_endpoint, Matter};
 
-use matter_camera::cluster_av_stream::{AvStreamHandler, AV_STREAM_CLUSTER};
-use matter_camera::cluster_occupancy::{OccupancyDataver, OccupancyHandler, OCCUPANCY_CLUSTER};
-use matter_camera::cluster_webrtc::{WebRtcHandler, WEBRTC_CLUSTER};
-use matter_camera::types::CameraEndpointState;
+use matter_camera::{MotionState, OccupancyDataver, OccupancyHandler, OCCUPANCY_CLUSTER};
 
 pub use rs_matter::dm::clusters::decl::bridged_device_basic_information::{
     self, ClusterHandler as _, KeepActiveRequest,
@@ -52,9 +55,14 @@ use rs_matter::dm::{InvokeContext, ReadContext};
 use rs_matter::tlv::{TLVBuilderParent, Utf8StrBuilder};
 use rs_matter::with;
 
-/// Camera device type — Matter 1.5 Basic Video Camera (0x0103)
-const DEV_TYPE_CAMERA: DeviceType = DeviceType {
-    dtype: 0x0103,
+use crate::hooks::{BridgeCamAvHooks, BridgeWebRtcHooks};
+use crate::onvif_bridge::CameraSlot;
+
+/// Camera device type — Matter 1.5 Camera (0x0142). Previously we used
+/// 0x0103, which is OnOffLight in the Matter spec — that mistake caused
+/// Google Home to render the bridge as light switches.
+const DEV_TYPE_MATTER_CAMERA: DeviceType = DeviceType {
+    dtype: 0x0142,
     drev: 1,
 };
 
@@ -73,13 +81,81 @@ pub const MAX_CAMERAS: usize = 8;
 /// The remaining `MAX_CAMERAS - WITH_OCCUPANCY_CAMERAS` slots are camera-only.
 pub const WITH_OCCUPANCY_CAMERAS: usize = 7;
 
-/// Endpoint IDs: 0 = root, 1 = aggregator, 2..8 = camera+occupancy slots,
+/// Endpoint IDs: 0 = root, 1 = aggregator, 2..=8 = camera+occupancy slots,
 /// 9 = camera-only slot.
 const AGGREGATOR_EP: u16 = 1;
-#[allow(dead_code)]
-const CAMERA_EP_START: u16 = 2;
+pub const CAMERA_EP_START: u16 = 2;
+
+// ── CameraAvStreamManagement (0x0551) sizing ──
+// Each camera advertises a small number of pre-allocated video streams
+// (livestream + thumbnail typically). VIGI cameras ship 2 profiles; 4 is
+// generous headroom. Audio is disabled — VIGI cameras encode G.711, which
+// isn't in the Matter `AudioCodecEnum` (only Opus / AAC-LC).
+const MAX_VIDEO: usize = 4;
+const MAX_AUDIO: usize = 0;
+
+// ── WebRTCTransportProvider (0x0553) sizing — mirrors upstream example ──
+const N_SESSIONS: usize = 4;
+const SDP_LEN: usize = 8 * 1024;
+const OUT_LEN: usize = SDP_LEN + 1024;
+
+pub type CamAvHandler =
+    CameraAvStreamHandler<'static, BridgeCamAvHooks, MAX_VIDEO, MAX_AUDIO>;
+pub type WebRtcHandler =
+    WebRtcProvHandler<BridgeWebRtcHooks, N_SESSIONS, SDP_LEN, OUT_LEN>;
+
+const STREAM_USAGES: &[StreamUsageEnum] = &[StreamUsageEnum::LiveView];
+
+const RATE_DISTORTION: &[RateDistortionPoint] = &[
+    RateDistortionPoint {
+        codec: VideoCodecEnum::H264,
+        min_resolution: (320, 240),
+        min_bit_rate: 200_000,
+    },
+    RateDistortionPoint {
+        codec: VideoCodecEnum::HEVC,
+        min_resolution: (320, 240),
+        min_bit_rate: 200_000,
+    },
+];
+
+const CAM_AV_CONFIG: CameraAvStreamConfig<'static> = CameraAvStreamConfig {
+    max_concurrent_encoders: 4,
+    max_encoded_pixel_rate: 3840 * 2160 * 30,
+    sensor: VideoSensorParams {
+        sensor_width: 3840,
+        sensor_height: 2160,
+        max_fps: 30,
+        max_hdrfps: None,
+    },
+    min_viewport: (320, 240),
+    max_content_buffer_size: 1_048_576,
+    max_network_bandwidth: 10_000,
+    supported_stream_usages: STREAM_USAGES,
+    default_stream_usage_priorities: STREAM_USAGES,
+    rate_distortion_points: RATE_DISTORTION,
+    mic_capabilities: None,
+};
 
 fn main() -> Result<(), Error> {
+    // Run the actual main on a dedicated thread with a large stack. With the
+    // `large-buffers` rs-matter feature enabled, `Matter`, `PooledBuffers`,
+    // and the deeply-nested data-model handler chain push the stack well past
+    // the 8 MB OS default — without this we abort with `stack overflow`
+    // before any logging reaches the journal. The upstream `webrtc_camera`
+    // example dodges this by putting these structs in `StaticCell` (BSS); the
+    // big-stack-thread approach lets us keep the existing `Matter::new_default`
+    // pattern with no further refactor.
+    std::thread::Builder::new()
+        .name("matter-main".into())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(matter_main)
+        .expect("failed to spawn matter-main thread")
+        .join()
+        .expect("matter-main thread panicked")
+}
+
+fn matter_main() -> Result<(), Error> {
     dotenvy::dotenv().ok();
 
     env_logger::init_from_env(
@@ -110,8 +186,8 @@ fn main() -> Result<(), Error> {
             .into_boxed_str(),
     );
     let dev_det = rs_matter::dm::clusters::basic_info::BasicInfoConfig {
-        vid: 0xFFF1,  // Test vendor ID (required for test DAC attestation)
-        pid: 0x8001,  // Test product ID
+        vid: 0xFFF1,
+        pid: 0x8001,
         product_name: "Matter-ONVIF Camera Bridge",
         vendor_name: "matter-onvif-bridge",
         device_name: "Camera Bridge",
@@ -120,6 +196,13 @@ fn main() -> Result<(), Error> {
         hw_ver_str: "1.0",
         sw_ver: 1,
         sw_ver_str: env!("CARGO_PKG_VERSION"),
+        // TCP / large-buffers intentionally OFF: enabling them caused
+        // post-CommissioningComplete `ReportData` / `InvokeResponse` frames
+        // to exceed UDP MTU, IPv6 fragments got dropped on the LAN, MRP
+        // retransmissions exhausted, and controllers (Aqara hub, Google
+        // Home) called RemoveFabric ~2 min in. Re-enable when WebRTC
+        // streaming is actually being wired up and we can verify the
+        // controller negotiates TCP for large frames.
         ..rs_matter::dm::clusters::basic_info::BasicInfoConfig::new()
     };
     let mut matter = Matter::new_default(&dev_det, TEST_DEV_COMM, &TEST_DEV_ATT, cfg.matter.port);
@@ -130,81 +213,85 @@ fn main() -> Result<(), Error> {
     let mut rand = crypto.rand()?;
     let mut events: Events = Events::new_default();
 
-    // Persistence — the new rs-matter uses a KvBlobStore model instead of the
-    // old Psm. Load persisted state before building the data model.
     let persist_path = std::path::PathBuf::from(&cfg.matter.storage_path);
     let mut kv = DirKvBlobStore::new(persist_path);
     let mut kv_buf = [0u8; 4096];
     futures_lite::future::block_on(matter.load_persist(&mut kv, &mut kv_buf))?;
     futures_lite::future::block_on(events.load_persist(&mut kv, &mut kv_buf))?;
 
-    // Create shared state for each camera endpoint
-    let camera_states: Vec<Arc<RwLock<CameraEndpointState>>> = (0..MAX_CAMERAS)
-        .map(|_| Arc::new(RwLock::new(CameraEndpointState::default())))
+    // Per-slot bridge-side state — only what BDBI / Occupancy need to read.
+    let camera_slots: Vec<Arc<RwLock<CameraSlot>>> = (0..MAX_CAMERAS)
+        .map(|_| Arc::new(RwLock::new(CameraSlot::default())))
         .collect();
 
-    // Create handlers for camera endpoints
-    let av_handlers: Vec<AvStreamHandler> = camera_states
-        .iter()
-        .map(|s| AvStreamHandler::new(Dataver::new_rand(&mut rand), Arc::clone(s)))
+    // Motion flags + dataver counters for occupancy-supporting slots only.
+    let motion_states: Vec<MotionState> = (0..WITH_OCCUPANCY_CAMERAS)
+        .map(|_| MotionState::new())
         .collect();
-    let mut webrtc_handlers: Vec<WebRtcHandler> = camera_states
-        .iter()
-        .map(|s| WebRtcHandler::new(Dataver::new_rand(&mut rand), Arc::clone(s)))
-        .collect();
-
-    // OccupancySensing handlers — only for the first WITH_OCCUPANCY_CAMERAS slots.
-    // Each handler holds an Arc<Dataver> so the bridge thread can bump the
-    // dataver from outside the Matter executor when a new ONVIF event arrives.
     let occupancy_datavers: Vec<OccupancyDataver> = (0..WITH_OCCUPANCY_CAMERAS)
         .map(|_| OccupancyDataver::new(rand.next_u32()))
         .collect();
     let occupancy_handlers: Vec<OccupancyHandler> = (0..WITH_OCCUPANCY_CAMERAS)
-        .map(|i| {
-            OccupancyHandler::new(occupancy_datavers[i].clone(), Arc::clone(&camera_states[i]))
-        })
+        .map(|i| OccupancyHandler::new(occupancy_datavers[i].clone(), motion_states[i].clone()))
         .collect();
 
-    // Start ONVIF + go2rtc bridge on a separate tokio thread
+    // Per-slot upstream cluster handlers. We need 8 distinct handler instances
+    // (each carries its own session table, Dataver, and slot-specific hooks),
+    // so allocate them on the heap and leak to `'static` — much simpler than
+    // declaring 8 named `StaticCell`s.
+    //
+    // We need access to `media_bridge.stream_names` before constructing the
+    // WebRTC handlers (the hooks hold a clone of the Arc), so build the ONVIF
+    // bridge first.
     let registry = onvif_client::registry::CameraRegistry::new(64);
-    let media_bridge = onvif_bridge::start_onvif_bridge(
+    let go2rtc_api = media::go2rtc_api::Go2RtcApi::new(&cfg.go2rtc.host, cfg.go2rtc.api_port);
+    let stream_names_shared: Arc<RwLock<std::collections::HashMap<usize, String>>> =
+        Arc::new(RwLock::new(std::collections::HashMap::new()));
+
+    let av_handlers_leaked: &'static [&'static CamAvHandler] = {
+        let mut v: Vec<&'static CamAvHandler> = Vec::with_capacity(MAX_CAMERAS);
+        for slot in 0..MAX_CAMERAS {
+            let endpoint_id = CAMERA_EP_START + slot as u16;
+            let h = CameraAvStreamHandler::new(
+                Dataver::new_rand(&mut rand),
+                endpoint_id,
+                CAM_AV_CONFIG,
+                CamAvFeature::VIDEO.bits(),
+                BridgeCamAvHooks,
+            );
+            v.push(Box::leak(Box::new(h)));
+        }
+        Vec::leak(v)
+    };
+
+    let webrtc_handlers_leaked: &'static [&'static WebRtcHandler] = {
+        let mut v: Vec<&'static WebRtcHandler> = Vec::with_capacity(MAX_CAMERAS);
+        for slot in 0..MAX_CAMERAS {
+            let endpoint_id = CAMERA_EP_START + slot as u16;
+            let hooks = BridgeWebRtcHooks::new(slot, go2rtc_api.clone(), stream_names_shared.clone());
+            let h = WebRtcProvHandler::new(Dataver::new_rand(&mut rand), endpoint_id, hooks);
+            v.push(Box::leak(Box::new(h)));
+        }
+        Vec::leak(v)
+    };
+
+    // Cross-thread channel for "seed pre-allocated video stream into slot N".
+    // The ONVIF bridge thread sends; the main thread (which owns the
+    // `!Sync` cluster handlers) consumes and calls `add_preallocated_video`.
+    let (seed_tx, seed_rx) =
+        async_channel::unbounded::<(usize, rs_matter::dm::clusters::app::cam_av_stream::VideoStream)>();
+
+    let _media_bridge = onvif_bridge::start_onvif_bridge(
         &cfg,
-        &camera_states,
+        &camera_slots,
+        &motion_states,
         &occupancy_datavers,
+        seed_tx,
         registry,
+        go2rtc_api.clone(),
+        stream_names_shared.clone(),
     );
 
-    // Wire SDP exchange callbacks into WebRTC handlers BEFORE building the data model.
-    // Each handler gets a closure that looks up its stream name and calls go2rtc.
-    for (i, handler) in webrtc_handlers.iter_mut().enumerate() {
-        let api = media_bridge.api.clone();
-        let stream_names = media_bridge.stream_names.clone();
-
-        handler.set_sdp_exchange(Box::new(move |sdp_offer: &str| {
-            let stream_name = {
-                let names = stream_names.read().map_err(|e| format!("Lock error: {e}"))?;
-                names.get(&i).cloned().ok_or_else(|| {
-                    format!("No stream registered for endpoint slot {i}")
-                })?
-            };
-
-            // Run the async SDP exchange on a one-shot tokio runtime
-            // (we're on the Matter executor thread, not a tokio context)
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| format!("Failed to create tokio runtime: {e}"))?;
-
-            let api = api.clone();
-            rt.block_on(async {
-                let session = media::webrtc_session::WebRtcSession::new(stream_name, api);
-                let result = session.negotiate(sdp_offer).await?;
-                Ok((result.sdp_answer, result.ice_candidates))
-            })
-        }));
-    }
-
-    // Build the data model handler (borrows handlers immutably from here on)
     let dm = DataModel::new(
         &matter,
         &crypto,
@@ -213,10 +300,10 @@ fn main() -> Result<(), Error> {
         &events,
         dm_handler(
             rand,
-            &av_handlers,
-            &webrtc_handlers,
+            av_handlers_leaked,
+            webrtc_handlers_leaked,
             &occupancy_handlers,
-            &camera_states,
+            &camera_slots,
         ),
         SharedKvBlobStore::new(kv, kv_buf.as_mut_slice()),
         SharedNetworks::new(EthNetwork::new_default()),
@@ -226,10 +313,8 @@ fn main() -> Result<(), Error> {
     let mut respond = pin!(responder.run::<4, 4>());
     let mut dm_job = pin!(dm.run());
 
-    // Create a dual-stack UDP socket explicitly via socket2.
-    // Rust's std UdpSocket::bind on "[::]:port" may set IPV6_V6ONLY=1,
-    // which prevents receiving IPv6 packets from chip-tool.
-    let socket = {
+    // Dual-stack UDP socket via socket2 (Rust std sets IPV6_V6ONLY=1 by default).
+    let udp_socket = {
         let s = socket2::Socket::new(
             socket2::Domain::IPV6,
             socket2::Type::DGRAM,
@@ -243,7 +328,27 @@ fn main() -> Result<(), Error> {
     };
 
     let mut mdns = pin!(mdns::run_mdns(&matter, &crypto));
-    let mut transport = pin!(matter.run(&crypto, &socket, &socket, &socket));
+    let mut transport = pin!(matter.run(&crypto, &udp_socket, &udp_socket, &udp_socket));
+
+    // Seeding driver: receives "(slot, VideoStream)" messages from the
+    // ONVIF bridge thread and calls `add_preallocated_video` on the
+    // matching handler. Runs on the same thread as the rs-matter executor
+    // so we can hand it `&'static` handler refs that are `!Sync`.
+    let mut seed_driver = pin!(async {
+        while let Ok((slot, stream)) = seed_rx.recv().await {
+            if let Some(handler) = av_handlers_leaked.get(slot) {
+                match handler.add_preallocated_video(stream) {
+                    Ok(id) => log::info!("Seeded video stream id={id} into slot {slot}"),
+                    Err(e) => log::warn!("add_preallocated_video failed for slot {slot}: {e:?}"),
+                }
+            } else {
+                log::warn!("seed_driver: slot {slot} out of range");
+            }
+        }
+        // Channel closed shouldn't happen during normal operation; park
+        // forever rather than letting the select arm complete.
+        futures_lite::future::pending::<Result<(), Error>>().await
+    });
 
     if !matter.is_commissioned() {
         log::info!("Device not commissioned. Displaying QR code...");
@@ -254,62 +359,54 @@ fn main() -> Result<(), Error> {
         log::info!("Device already commissioned.");
     }
 
-    let all = select4(
-        &mut transport,
-        &mut mdns,
-        &mut respond,
-        &mut dm_job,
-    );
-
-    futures_lite::future::block_on(all.coalesce())
+    // `Coalesce` isn't implemented for `Select5`, so wrap the four core
+    // futures in a select4 first, then race the seed driver against the
+    // result via a 2-way select.
+    let main = pin!(select4(&mut transport, &mut mdns, &mut respond, &mut dm_job).coalesce());
+    match futures_lite::future::block_on(select(main, &mut seed_driver)) {
+        Either::First(r) => r,
+        Either::Second(r) => r,
+    }
 }
 
 // ── Node definition ──
 
-/// Build the static Node metadata with pre-allocated camera endpoints.
-///
-/// We use a macro to generate the endpoint array at compile time since
-/// `Node` requires `&'static [Endpoint]`.
 macro_rules! camera_endpoints {
     (
         with_occupancy: [$($occ_id:expr),* $(,)?],
         plain: [$($plain_id:expr),* $(,)?] $(,)?
     ) => {
         &[
-            // Endpoint 0: Root
             root_endpoint!(geth),
-            // Endpoint 1: Aggregator
             Endpoint {
                 id: AGGREGATOR_EP,
                 device_types: devices!(DEV_TYPE_AGGREGATOR),
                 clusters: clusters!(desc::DescHandler::CLUSTER),
             },
-            // Camera endpoints with OccupancySensing
             $(
                 Endpoint {
                     id: $occ_id,
-                    device_types: devices!(DEV_TYPE_CAMERA, DEV_TYPE_BRIDGED_NODE),
+                    device_types: devices!(DEV_TYPE_MATTER_CAMERA, DEV_TYPE_BRIDGED_NODE),
                     clusters: clusters!(
                         desc::DescHandler::CLUSTER,
                         groups::GroupsHandler::CLUSTER,
                         BridgedHandler::CLUSTER,
-                        AV_STREAM_CLUSTER,
-                        WEBRTC_CLUSTER,
+                        CamAvHandler::CLUSTER,
+                        WebRtcHandler::CLUSTER,
                         OCCUPANCY_CLUSTER
                     ),
                 },
             )*
-            // Camera-only endpoints (no OccupancySensing)
             $(
                 Endpoint {
                     id: $plain_id,
-                    device_types: devices!(DEV_TYPE_CAMERA, DEV_TYPE_BRIDGED_NODE),
+                    device_types: devices!(DEV_TYPE_MATTER_CAMERA, DEV_TYPE_BRIDGED_NODE),
                     clusters: clusters!(
                         desc::DescHandler::CLUSTER,
                         groups::GroupsHandler::CLUSTER,
                         BridgedHandler::CLUSTER,
-                        AV_STREAM_CLUSTER,
-                        WEBRTC_CLUSTER
+                        CamAvHandler::CLUSTER,
+                        WebRtcHandler::CLUSTER
                     ),
                 },
             )*
@@ -329,11 +426,11 @@ const NODE: Node<'static> = Node {
 #[derive(Clone)]
 pub struct BridgedHandler {
     dataver: Dataver,
-    state: Arc<RwLock<CameraEndpointState>>,
+    state: Arc<RwLock<CameraSlot>>,
 }
 
 impl BridgedHandler {
-    pub fn new(dataver: Dataver, state: Arc<RwLock<CameraEndpointState>>) -> Self {
+    pub fn new(dataver: Dataver, state: Arc<RwLock<CameraSlot>>) -> Self {
         Self { dataver, state }
     }
 
@@ -341,7 +438,7 @@ impl BridgedHandler {
         bridged_device_basic_information::HandlerAdaptor(self)
     }
 
-    fn read_state_string(&self, f: impl Fn(&CameraEndpointState) -> &str) -> String {
+    fn read_state_string(&self, f: impl Fn(&CameraSlot) -> &str) -> String {
         self.state
             .read()
             .map(|s| f(&s).to_string())
@@ -350,10 +447,28 @@ impl BridgedHandler {
 }
 
 impl bridged_device_basic_information::ClusterHandler for BridgedHandler {
+    // Advertise only the attributes our handler actually implements. The
+    // generated trait's default impl for un-overridden attributes returns
+    // `InvalidAction`, so declaring `with!(all)` causes wildcard reads (e.g.
+    // Google Home / Aqara post-CASE) to hit InvalidAction on every optional
+    // attr we don't fill in (VendorID, ProductID, HardwareVersion (numeric),
+    // SoftwareVersion (numeric), ManufacturingDate, PartNumber, ProductURL,
+    // ProductLabel, ProductAppearance, and the Matter-1.5-new
+    // ConfigurationVersion). Controllers see InvalidAction on a bridged
+    // device and abandon commissioning by issuing RemoveFabric. Required
+    // attrs (Reachable, UniqueID) come in via `required;`.
     const CLUSTER: rs_matter::dm::Cluster<'static> =
         bridged_device_basic_information::FULL_CLUSTER
             .with_features(0)
-            .with_attrs(with!(all))
+            .with_attrs(with!(
+                required;
+                bridged_device_basic_information::AttributeId::VendorName
+                    | bridged_device_basic_information::AttributeId::ProductName
+                    | bridged_device_basic_information::AttributeId::NodeLabel
+                    | bridged_device_basic_information::AttributeId::SerialNumber
+                    | bridged_device_basic_information::AttributeId::HardwareVersionString
+                    | bridged_device_basic_information::AttributeId::SoftwareVersionString
+            ))
             .with_cmds(with!());
 
     fn dataver(&self) -> u32 {
@@ -442,35 +557,20 @@ impl bridged_device_basic_information::ClusterHandler for BridgedHandler {
 
 // ── Data Model handler composition ──
 
-/// Compose the full data model handler chain.
-///
-/// This chains the root endpoint system handlers with the aggregator descriptor
-/// and all 16 pre-allocated camera endpoint handlers.
 fn dm_handler<'a>(
     mut rand: impl RngCore + Copy,
-    av_handlers: &'a [AvStreamHandler],
-    webrtc_handlers: &'a [WebRtcHandler],
+    av_handlers: &'static [&'static CamAvHandler],
+    webrtc_handlers: &'static [&'static WebRtcHandler],
     occupancy_handlers: &'a [OccupancyHandler],
-    camera_states: &'a [Arc<RwLock<CameraEndpointState>>],
+    camera_slots: &'a [Arc<RwLock<CameraSlot>>],
 ) -> impl AsyncMetadata + AsyncHandler + 'a {
-    // Build the camera endpoint handler chain
-    let mut chain = EmptyHandler
-        // Aggregator endpoint descriptor
-        .chain(
-            EpClMatcher::new(Some(AGGREGATOR_EP), Some(desc::DescHandler::CLUSTER.id)),
-            Async(desc::DescHandler::new_aggregator(Dataver::new_rand(&mut rand)).adapt()),
-        );
+    let chain = EmptyHandler.chain(
+        EpClMatcher::new(Some(AGGREGATOR_EP), Some(desc::DescHandler::CLUSTER.id)),
+        Async(desc::DescHandler::new_aggregator(Dataver::new_rand(&mut rand)).adapt()),
+    );
 
-    // For each camera endpoint, chain in all cluster handlers
-    // We do this inline with a macro since the chain type must be known at compile time.
-    // However, since we're returning `impl AsyncHandler`, we can build it dynamically
-    // using a loop — but rs-matter's ChainedHandler is generic, so each .chain() call
-    // changes the type. We need to use a macro or manual unrolling.
-    //
-    // For Phase 1, we'll use a helper that chains all 16 endpoints.
-    // Common cluster handlers shared by every camera endpoint variant.
     macro_rules! chain_camera_base {
-        ($chain:expr, $rand:expr, $av:expr, $webrtc:expr, $states:expr, $ep:expr, $idx:expr) => {
+        ($chain:expr, $rand:expr, $av:expr, $webrtc:expr, $slots:expr, $ep:expr, $idx:expr) => {
             $chain
                 .chain(
                     EpClMatcher::new(Some($ep), Some(desc::DescHandler::CLUSTER.id)),
@@ -482,49 +582,45 @@ fn dm_handler<'a>(
                 )
                 .chain(
                     EpClMatcher::new(Some($ep), Some(BridgedHandler::CLUSTER.id)),
-                    Async(BridgedHandler::new(Dataver::new_rand(&mut $rand), Arc::clone(&$states[$idx])).adapt()),
+                    Async(
+                        BridgedHandler::new(
+                            Dataver::new_rand(&mut $rand),
+                            Arc::clone(&$slots[$idx]),
+                        )
+                        .adapt(),
+                    ),
                 )
                 .chain(
-                    EpClMatcher::new(Some($ep), Some(AV_STREAM_CLUSTER.id)),
-                    Async(&$av[$idx]),
+                    EpClMatcher::new(Some($ep), Some(CamAvHandler::CLUSTER.id)),
+                    cam_av_stream::HandlerAsyncAdaptor($av[$idx]),
                 )
                 .chain(
-                    EpClMatcher::new(Some($ep), Some(WEBRTC_CLUSTER.id)),
-                    Async(&$webrtc[$idx]),
+                    EpClMatcher::new(Some($ep), Some(WebRtcHandler::CLUSTER.id)),
+                    webrtc_prov::HandlerAsyncAdaptor($webrtc[$idx]),
                 )
         };
     }
 
-    // Endpoints 2..=13: camera + OccupancySensing (12 slots).
     macro_rules! chain_camera_ep_with_occupancy {
-        ($chain:expr, $rand:expr, $av:expr, $webrtc:expr, $occ:expr, $states:expr, $ep:expr, $idx:expr) => {
-            chain_camera_base!($chain, $rand, $av, $webrtc, $states, $ep, $idx)
-                .chain(
-                    EpClMatcher::new(Some($ep), Some(OCCUPANCY_CLUSTER.id)),
-                    Async(&$occ[$idx]),
-                )
+        ($chain:expr, $rand:expr, $av:expr, $webrtc:expr, $occ:expr, $slots:expr, $ep:expr, $idx:expr) => {
+            chain_camera_base!($chain, $rand, $av, $webrtc, $slots, $ep, $idx).chain(
+                EpClMatcher::new(Some($ep), Some(OCCUPANCY_CLUSTER.id)),
+                Async(&$occ[$idx]),
+            )
         };
     }
 
-    // Endpoints 2..=8: camera + OccupancySensing (7 slots).
-    let chain = chain_camera_ep_with_occupancy!(chain, rand, av_handlers, webrtc_handlers, occupancy_handlers, camera_states, 2, 0);
-    let chain = chain_camera_ep_with_occupancy!(chain, rand, av_handlers, webrtc_handlers, occupancy_handlers, camera_states, 3, 1);
-    let chain = chain_camera_ep_with_occupancy!(chain, rand, av_handlers, webrtc_handlers, occupancy_handlers, camera_states, 4, 2);
-    let chain = chain_camera_ep_with_occupancy!(chain, rand, av_handlers, webrtc_handlers, occupancy_handlers, camera_states, 5, 3);
-    let chain = chain_camera_ep_with_occupancy!(chain, rand, av_handlers, webrtc_handlers, occupancy_handlers, camera_states, 6, 4);
-    let chain = chain_camera_ep_with_occupancy!(chain, rand, av_handlers, webrtc_handlers, occupancy_handlers, camera_states, 7, 5);
-    let chain = chain_camera_ep_with_occupancy!(chain, rand, av_handlers, webrtc_handlers, occupancy_handlers, camera_states, 8, 6);
-    // Endpoint 9: camera-only (1 slot).
-    let chain = chain_camera_base!(chain, rand, av_handlers, webrtc_handlers, camera_states, 9, 7);
+    let chain = chain_camera_ep_with_occupancy!(chain, rand, av_handlers, webrtc_handlers, occupancy_handlers, camera_slots, 2, 0);
+    let chain = chain_camera_ep_with_occupancy!(chain, rand, av_handlers, webrtc_handlers, occupancy_handlers, camera_slots, 3, 1);
+    let chain = chain_camera_ep_with_occupancy!(chain, rand, av_handlers, webrtc_handlers, occupancy_handlers, camera_slots, 4, 2);
+    let chain = chain_camera_ep_with_occupancy!(chain, rand, av_handlers, webrtc_handlers, occupancy_handlers, camera_slots, 5, 3);
+    let chain = chain_camera_ep_with_occupancy!(chain, rand, av_handlers, webrtc_handlers, occupancy_handlers, camera_slots, 6, 4);
+    let chain = chain_camera_ep_with_occupancy!(chain, rand, av_handlers, webrtc_handlers, occupancy_handlers, camera_slots, 7, 5);
+    let chain = chain_camera_ep_with_occupancy!(chain, rand, av_handlers, webrtc_handlers, occupancy_handlers, camera_slots, 8, 6);
+    let chain = chain_camera_base!(chain, rand, av_handlers, webrtc_handlers, camera_slots, 9, 7);
 
     (
         NODE,
-        endpoints::with_eth_sys(
-            &false,
-            &(),
-            &SysNetifs,
-            rand,
-            chain,
-        ),
+        endpoints::with_eth_sys(&false, &(), &SysNetifs, rand, chain),
     )
 }

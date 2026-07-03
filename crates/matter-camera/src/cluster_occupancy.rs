@@ -4,9 +4,8 @@
 //! endpoint when the underlying ONVIF device advertises a MotionAlarm topic
 //! (see slot pool split in `bridge::main`).
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
-use std::sync::RwLock;
 
 use rs_matter::attributes;
 use rs_matter::commands;
@@ -16,8 +15,6 @@ use rs_matter::dm::{
 };
 use rs_matter::error::{Error, ErrorCode};
 use strum::FromRepr;
-
-use crate::types::CameraEndpointState;
 
 pub const CLUSTER_ID: u32 = 0x0406;
 const CLUSTER_REVISION: u16 = 5;
@@ -33,16 +30,8 @@ pub enum Attributes {
 
 rs_matter::attribute_enum!(Attributes);
 
-// OccupancySensing has no commands — no Commands enum needed.
-
-/// Sensor type per Matter 1.4 §2.7.5.2: 0 = PIR, 1 = Ultrasonic, 2 = PIR+Ultrasonic, 3 = PhysicalContact.
-/// Cameras are best modelled as PIR for controller compatibility.
 const SENSOR_TYPE_PIR: u8 = 0;
-/// Bitmap §2.7.5.3 — bit 0 = PIR.
 const SENSOR_TYPE_BITMAP_PIR: u8 = 0b0000_0001;
-
-/// FeatureMap bit 0 = PIR. Required by Google Home for the cluster to be
-/// surfaced as a motion sensor entity.
 const FEATURE_MAP_PIR: u32 = 0b0000_0001;
 
 pub const OCCUPANCY_CLUSTER: Cluster<'static> = Cluster::new(
@@ -59,18 +48,35 @@ pub const OCCUPANCY_CLUSTER: Cluster<'static> = Cluster::new(
         )
     ),
     commands!(),
-    &[], // events: none
-    |_, _, _| true, // with_attrs
-    |_, _, _| true, // with_cmds
-    |_, _, _| true, // with_events
+    &[],
+    |_, _, _| true,
+    |_, _, _| true,
+    |_, _, _| true,
 );
 
-/// Cluster handler that reads `motion_detected` from the shared camera state.
-///
-/// rs-matter's `Dataver` is intentionally single-threaded (it wraps a `Cell`
-/// behind a `NoopRawMutex`), so we can't share it with the tokio bridge
-/// thread that pumps ONVIF events. Instead the dataver counter is an
-/// `AtomicU32` cloned via `Arc` — the bridge thread calls
+/// Thread-safe motion flag shared between the ONVIF event pump and the
+/// Matter-side `OccupancyHandler`.
+#[derive(Clone, Default)]
+pub struct MotionState(Arc<AtomicBool>);
+
+impl MotionState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_detected(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    /// Returns `true` if the value changed.
+    pub fn set(&self, v: bool) -> bool {
+        self.0.swap(v, Ordering::AcqRel) != v
+    }
+}
+
+/// rs-matter's `Dataver` is single-threaded (Cell behind a NoopRawMutex), so
+/// we can't share it with the tokio motion-pump thread. Instead the dataver
+/// counter is an `AtomicU32` cloned via `Arc`; the bridge thread calls
 /// [`OccupancyDataver::bump`] when a new event arrives.
 #[derive(Clone, Default)]
 pub struct OccupancyDataver(Arc<AtomicU32>);
@@ -84,46 +90,34 @@ impl OccupancyDataver {
         self.0.load(Ordering::Acquire)
     }
 
-    /// Increment and return the new value. Safe to call from any thread.
     pub fn bump(&self) -> u32 {
-        // wrapping add via fetch_add (u32 wraps naturally)
         self.0.fetch_add(1, Ordering::AcqRel).wrapping_add(1)
     }
 }
 
 pub struct OccupancyHandler {
     dataver: OccupancyDataver,
-    state: Arc<RwLock<CameraEndpointState>>,
+    motion: MotionState,
 }
 
 impl OccupancyHandler {
-    pub fn new(dataver: OccupancyDataver, state: Arc<RwLock<CameraEndpointState>>) -> Self {
-        Self { dataver, state }
-    }
-
-    /// Clone of the dataver handle — handed to the motion pump so it can bump
-    /// the version when a new event arrives.
-    pub fn dataver_handle(&self) -> OccupancyDataver {
-        self.dataver.clone()
+    pub fn new(dataver: OccupancyDataver, motion: MotionState) -> Self {
+        Self { dataver, motion }
     }
 }
 
 impl Handler for OccupancyHandler {
     fn read(&self, ctx: impl ReadContext, reply: impl ReadReply) -> Result<(), Error> {
         let attr = ctx.attr();
-
         let dv = self.dataver.get();
         if let Some(writer) = reply.with_dataver(dv)? {
             if attr.is_system() {
                 return OCCUPANCY_CLUSTER.read(attr, writer);
             }
 
-            let state = self.state.read().map_err(|_| ErrorCode::Busy)?;
-
             match attr.attr_id.try_into()? {
                 Attributes::Occupancy => {
-                    // Occupancy is a bitmap8, bit 0 = occupied
-                    let bits: u8 = if state.motion_detected { 0b0000_0001 } else { 0 };
+                    let bits: u8 = if self.motion.is_detected() { 0b0000_0001 } else { 0 };
                     writer.set(bits)
                 }
                 Attributes::OccupancySensorType => writer.set(SENSOR_TYPE_PIR),

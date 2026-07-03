@@ -14,7 +14,7 @@ repository = "https://github.com/user/matter-onvif-bridge"
 
 [workspace.dependencies]
 # Matter protocol
-rs-matter = { git = "https://github.com/project-chip/rs-matter", package = "rs-matter" }
+rs-matter = { git = "https://github.com/project-chip/rs-matter", package = "rs-matter", rev = "52c0fcd" }
 
 # ONVIF client
 oxvif = "0.9.3"

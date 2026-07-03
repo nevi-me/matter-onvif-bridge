@@ -1,58 +1,87 @@
-//! Bridges ONVIF discovery and go2rtc media to the Matter camera endpoint states.
+//! Bridges ONVIF discovery + go2rtc media to the Matter camera endpoints.
 //!
 //! Runs on a separate tokio runtime thread that:
-//! 1. Starts go2rtc manager (wait for readiness)
+//! 1. Starts go2rtc manager (waits for readiness)
 //! 2. Runs ONVIF WS-Discovery loop
-//! 3. Feeds discovered cameras into the CameraRegistry
-//! 4. Registers RTSP streams in go2rtc via StreamManager
-//! 5. Populates pre-allocated camera endpoint states with real ONVIF data
-//! 6. Stores the go2rtc API and slot map for WebRTC command handling
+//! 3. Feeds discovered cameras into the `CameraRegistry`
+//! 4. Registers RTSP streams in go2rtc via `StreamManager`
+//! 5. Pre-seeds each camera's AV stream into its slot's
+//!    `CameraAvStreamHandler::add_preallocated_video`
+//! 6. Populates the bridge-side `CameraSlot` (BDBI labels, motion flag)
+//! 7. Spawns a motion pump per camera advertising MotionAlarm events
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use matter_camera::types::{CameraEndpointState, VideoResolution, VideoSensorParams};
+use async_channel::Sender;
+use matter_camera::{MotionState, OccupancyDataver};
 use media::go2rtc_api::Go2RtcApi;
 use media::go2rtc_manager::{Go2RtcManager, Go2RtcMode};
 use onvif_client::discovery::{DiscoveryConfig, DiscoveryEvent, DiscoveryMode};
-use matter_camera::cluster_occupancy::OccupancyDataver;
 use onvif_client::motion::{spawn_motion_pump, MotionPumpConfig};
 use onvif_client::registry::{CameraRegistry, RegistryEvent};
 use onvif_client::types::CameraDevice;
+use rs_matter::dm::clusters::app::cam_av_stream::{StreamUsageEnum, VideoCodecEnum, VideoStream};
 use tokio::sync::mpsc;
 
 use crate::config::{self, Config};
 use crate::slot_persistence::SlotMap;
 use crate::{MAX_CAMERAS, WITH_OCCUPANCY_CAMERAS};
 
-/// Shared state accessible from the Matter handler thread for WebRTC negotiation.
+/// Cross-thread message: "seed slot N's CameraAvStreamHandler with this
+/// pre-allocated VideoStream." Sent from the ONVIF bridge thread, consumed
+/// by the seeding task running on the rs-matter executor (main thread). We
+/// can't send the handler refs themselves because they use `NoopRawMutex`
+/// and are `!Sync`.
+pub type SeedTx = Sender<(usize, VideoStream)>;
+
+/// Slim per-slot state held by the bridge. Cluster state (video/audio
+/// streams, WebRTC sessions, etc.) is owned by the upstream rs-matter
+/// handlers — this struct only carries what `BridgedDeviceBasicInformation`
+/// needs to answer reads about the bridged camera.
+#[derive(Debug, Clone, Default)]
+pub struct CameraSlot {
+    pub occupied: bool,
+    pub node_label: String,
+    pub vendor_name: String,
+    pub product_name: String,
+    pub serial_number: String,
+    pub hardware_version_string: String,
+    pub software_version_string: String,
+    pub unique_id: String,
+    pub supports_ptz: bool,
+}
+
+/// Shared state accessible from the Matter handler thread (today: the
+/// `BridgeWebRtcHooks` look up `stream_names` to find the right go2rtc
+/// stream for an incoming SDP offer).
 #[derive(Clone)]
 pub struct MediaBridge {
-    /// go2rtc API client for SDP exchange.
-    pub api: Go2RtcApi,
-    /// Maps camera ID → endpoint slot index (0-based, endpoint = slot + 2).
+    /// camera id → slot index
     pub slot_map: Arc<RwLock<HashMap<String, usize>>>,
-    /// Maps endpoint slot index → stream name for go2rtc.
+    /// slot index → go2rtc stream name
     pub stream_names: Arc<RwLock<HashMap<usize, String>>>,
 }
 
-/// Start the ONVIF + go2rtc bridge on a separate tokio runtime thread.
+/// Spawn the ONVIF + go2rtc bridge on a dedicated tokio thread.
 ///
-/// Returns a `MediaBridge` that can be used by the Matter WebRTC handler
-/// to perform SDP negotiation via go2rtc.
+/// `go2rtc_api` and `stream_names` are owned by the caller so the WebRTC
+/// hooks can share the same `Arc`s (they look up the go2rtc stream name
+/// for an incoming SDP offer in the shared map).
 pub fn start_onvif_bridge(
     cfg: &Config,
-    camera_states: &[Arc<RwLock<CameraEndpointState>>],
+    slots: &[Arc<RwLock<CameraSlot>>],
+    motion_states: &[MotionState],
     occupancy_datavers: &[OccupancyDataver],
+    seed_tx: SeedTx,
     registry: CameraRegistry,
+    go2rtc_api: Go2RtcApi,
+    stream_names: Arc<RwLock<HashMap<usize, String>>>,
 ) -> MediaBridge {
-    let go2rtc_api = Go2RtcApi::new(&cfg.go2rtc.host, cfg.go2rtc.api_port);
-
     let media_bridge = MediaBridge {
-        api: go2rtc_api.clone(),
         slot_map: Arc::new(RwLock::new(HashMap::new())),
-        stream_names: Arc::new(RwLock::new(HashMap::new())),
+        stream_names,
     };
 
     let discovery_config = DiscoveryConfig {
@@ -79,8 +108,9 @@ pub fn start_onvif_bridge(
         &cfg.go2rtc.path,
     );
 
-    let states = camera_states.to_vec();
-    let occupancy_datavers = occupancy_datavers.to_vec();
+    let slots_owned = slots.to_vec();
+    let motion_states_owned = motion_states.to_vec();
+    let occupancy_datavers_owned = occupancy_datavers.to_vec();
     let registry_clone = registry.clone();
     let bridge_clone = media_bridge.clone();
     let onvif_username = cfg.onvif.username.clone();
@@ -99,15 +129,11 @@ pub fn start_onvif_bridge(
             rt.block_on(async move {
                 log::info!("ONVIF/media bridge thread started");
 
-                // 1. Start go2rtc
                 if let Err(e) = go2rtc_manager.start().await {
                     log::error!("Failed to start go2rtc: {e}");
-                    // Continue anyway — go2rtc may come up later
                 }
-
                 log::info!("go2rtc started, launching stream manager and ONVIF discovery");
 
-                // 2. Spawn stream manager (registers RTSP streams in go2rtc)
                 let api_for_streams = go2rtc_api.clone();
                 let registry_for_streams = registry_clone.clone();
                 let stream_user = onvif_username.clone();
@@ -122,25 +148,23 @@ pub fn start_onvif_bridge(
                     .await;
                 });
 
-                // 3. Spawn ONVIF discovery
                 let (discovery_tx, mut discovery_rx) = mpsc::channel(64);
                 tokio::spawn(onvif_client::discovery::run_discovery(
                     discovery_config,
                     discovery_tx,
                 ));
 
-                // 4. Process discovery events → registry → state population
                 let mut registry_rx = registry_clone.subscribe();
-                // Persistent slot allocator: keyed by camera id (ONVIF
-                // serial). Stable across restarts so Google Home room
-                // assignments don't drift when discovery order changes.
                 let mut slot_map = SlotMap::load(
                     &storage_dir,
                     MAX_CAMERAS,
                     WITH_OCCUPANCY_CAMERAS,
                 );
-                // Tracks the spawned motion pump per slot so we can abort on remove.
                 let mut motion_tasks: HashMap<usize, tokio::task::JoinHandle<()>> = HashMap::new();
+                // The upstream `add_preallocated_video` has no remove counterpart,
+                // so we only seed a slot once. Subsequent reconnections of the
+                // same camera reuse the existing pre-allocated stream.
+                let mut seeded: HashSet<usize> = HashSet::new();
 
                 loop {
                     tokio::select! {
@@ -158,11 +182,8 @@ pub fn start_onvif_bridge(
                         Ok(event) = registry_rx.recv() => {
                             match event {
                                 RegistryEvent::Added(camera) => {
-                                    let slot = slot_map
-                                        .assign(&camera.id, camera.supports_motion);
-
+                                    let slot = slot_map.assign(&camera.id, camera.supports_motion);
                                     if let Some(slot) = slot {
-                                        // Update slot maps
                                         let stream_name = sanitize_stream_name(&camera.id);
                                         if let Ok(mut map) = bridge_clone.slot_map.write() {
                                             map.insert(camera.id.clone(), slot);
@@ -171,31 +192,31 @@ pub fn start_onvif_bridge(
                                             map.insert(slot, stream_name);
                                         }
 
-                                        // Prefer serial-keyed lookup (stable across IP changes),
-                                        // fall back to host-keyed.
                                         let friendly_name = camera_names
                                             .get(&camera.device_info.serial_number)
                                             .or_else(|| camera_names.get(&camera.id))
                                             .or_else(|| camera_names.get(&camera.host))
                                             .cloned();
-                                        populate_camera_state(
-                                            &states[slot],
+                                        populate_camera_slot(
+                                            &slots_owned[slot],
                                             &camera,
                                             friendly_name.as_deref(),
                                         );
+
+                                        if seeded.insert(slot) {
+                                            seed_av_streams(slot, &camera, &seed_tx);
+                                        }
+
                                         log::info!(
-                                            "Camera '{}' ({}) → endpoint {} (motion={}), stream registered",
+                                            "Camera '{}' ({}) → endpoint {} (motion={}, ptz={}), stream registered",
                                             friendly_name.as_deref().unwrap_or(&camera.device_info.model),
                                             camera.id,
                                             slot + 2,
                                             camera.supports_motion,
+                                            camera.supports_ptz,
                                         );
 
-                                        // If this slot supports occupancy and the camera advertised
-                                        // a MotionAlarm topic, spawn the PullPoint pump now.
-                                        if camera.supports_motion
-                                            && slot < WITH_OCCUPANCY_CAMERAS
-                                        {
+                                        if camera.supports_motion && slot < WITH_OCCUPANCY_CAMERAS {
                                             if let Some(events_url) = camera.events_url.clone() {
                                                 let pump_cfg = MotionPumpConfig {
                                                     host: camera.host.clone(),
@@ -212,17 +233,13 @@ pub fn start_onvif_bridge(
                                                         )
                                                     }),
                                                 };
-                                                let state_for_pump = Arc::clone(&states[slot]);
-                                                let dataver_for_pump =
-                                                    occupancy_datavers[slot].clone();
+                                                let motion_state = motion_states_owned[slot].clone();
+                                                let dataver_for_pump = occupancy_datavers_owned[slot].clone();
                                                 let handle = spawn_motion_pump(
                                                     pump_cfg,
                                                     move |motion| {
-                                                        if let Ok(mut s) = state_for_pump.write() {
-                                                            if s.motion_detected != motion {
-                                                                s.motion_detected = motion;
-                                                                dataver_for_pump.bump();
-                                                            }
+                                                        if motion_state.set(motion) {
+                                                            dataver_for_pump.bump();
                                                         }
                                                     },
                                                 );
@@ -245,8 +262,8 @@ pub fn start_onvif_bridge(
                                                 .or_else(|| camera_names.get(&camera.id))
                                                 .or_else(|| camera_names.get(&camera.host))
                                                 .map(String::as_str);
-                                            populate_camera_state(
-                                                &states[slot],
+                                            populate_camera_slot(
+                                                &slots_owned[slot],
                                                 &camera,
                                                 friendly_name,
                                             );
@@ -256,8 +273,8 @@ pub fn start_onvif_bridge(
                                 RegistryEvent::Removed(id) => {
                                     if let Ok(mut map) = bridge_clone.slot_map.write() {
                                         if let Some(slot) = map.remove(&id) {
-                                            if let Ok(mut state) = states[slot].write() {
-                                                *state = CameraEndpointState::default();
+                                            if let Ok(mut s) = slots_owned[slot].write() {
+                                                *s = CameraSlot::default();
                                             }
                                             if let Ok(mut names) = bridge_clone.stream_names.write() {
                                                 names.remove(&slot);
@@ -265,7 +282,17 @@ pub fn start_onvif_bridge(
                                             if let Some(handle) = motion_tasks.remove(&slot) {
                                                 handle.abort();
                                             }
-                                            log::info!("Camera {} removed from endpoint {}", id, slot + 2);
+                                            // NB: pre-allocated AV streams are not removed —
+                                            // the upstream cluster has no remove API. If the
+                                            // camera reconnects we'll reuse the existing
+                                            // stream; if it stays gone forever the cluster
+                                            // attribute will reference a stale stream until
+                                            // the bridge restarts.
+                                            log::info!(
+                                                "Camera {} removed from endpoint {}",
+                                                id,
+                                                slot + 2
+                                            );
                                         }
                                     }
                                 }
@@ -280,63 +307,94 @@ pub fn start_onvif_bridge(
     media_bridge
 }
 
-/// Populate a camera endpoint's cluster state from ONVIF device data.
-///
-/// `friendly_name` overrides the auto-generated `manufacturer model` label
-/// when supplied via `ONVIF_CAMERA_NAMES`.
-fn populate_camera_state(
-    state_lock: &Arc<RwLock<CameraEndpointState>>,
+fn populate_camera_slot(
+    slot_lock: &Arc<RwLock<CameraSlot>>,
     camera: &CameraDevice,
     friendly_name: Option<&str>,
 ) {
-    let Ok(mut state) = state_lock.write() else {
-        log::error!("Failed to lock camera state for writing");
+    let Ok(mut slot) = slot_lock.write() else {
+        log::error!("Failed to lock camera slot for writing");
         return;
     };
 
-    // Mark slot as occupied
-    state.occupied = true;
-    state.motion_supported = camera.supports_motion;
-    state.motion_detected = false;
-
-    // BDBI fields from ONVIF device info
-    state.vendor_name = camera.device_info.manufacturer.clone();
-    state.product_name = camera.device_info.model.clone();
-    state.serial_number = camera.device_info.serial_number.clone();
-    state.hardware_version_string = camera.device_info.hardware_id.clone();
-    state.software_version_string = camera.device_info.firmware_version.clone();
-    state.unique_id = camera.id.clone();
-    state.node_label = friendly_name.map(str::to_string).unwrap_or_else(|| {
+    slot.occupied = true;
+    slot.vendor_name = camera.device_info.manufacturer.clone();
+    slot.product_name = camera.device_info.model.clone();
+    slot.serial_number = camera.device_info.serial_number.clone();
+    slot.hardware_version_string = camera.device_info.hardware_id.clone();
+    slot.software_version_string = camera.device_info.firmware_version.clone();
+    slot.unique_id = camera.id.clone();
+    slot.node_label = friendly_name.map(str::to_string).unwrap_or_else(|| {
         format!(
             "{} {}",
             camera.device_info.manufacturer, camera.device_info.model
         )
     });
-
-    // Video params from first profile
-    if let Some(profile) = camera.profiles.first() {
-        if let Some(ve) = &profile.video_encoder {
-            state.video_sensor_params = VideoSensorParams {
-                sensor_width: ve.width,
-                sensor_height: ve.height,
-                max_hdr_fps: None,
-                max_fps: ve.frame_rate,
-            };
-            state.viewport = VideoResolution {
-                width: ve.width,
-                height: ve.height,
-            };
-            state.current_frame_rate = ve.frame_rate;
-            state.max_encoded_pixel_rate =
-                ve.width as u32 * ve.height as u32 * ve.frame_rate as u32;
-        }
-    }
-
-    state.max_concurrent_video_encoders = camera.profiles.len().max(1) as u8;
-    state.max_network_bandwidth = 10_000;
+    slot.supports_ptz = camera.supports_ptz;
 }
 
-/// Sanitize camera ID into a go2rtc-compatible stream name.
+fn seed_av_streams(slot: usize, camera: &CameraDevice, seed_tx: &SeedTx) {
+    let Some(profile) = camera.profiles.first() else {
+        log::warn!(
+            "Camera {} has no media profiles — skipping AV stream seed",
+            camera.id
+        );
+        return;
+    };
+    let Some(ve) = profile.video_encoder.as_ref() else {
+        log::warn!(
+            "Camera {} profile {} has no video encoder — skipping AV stream seed",
+            camera.id,
+            profile.token
+        );
+        return;
+    };
+
+    let codec = match ve.codec.to_ascii_uppercase().as_str() {
+        "H265" | "HEVC" => VideoCodecEnum::HEVC,
+        "VVC" => VideoCodecEnum::VVC,
+        "AV1" => VideoCodecEnum::AV1,
+        _ => VideoCodecEnum::H264,
+    };
+
+    let stream = VideoStream {
+        video_stream_id: 0, // overwritten by handler
+        stream_usage: StreamUsageEnum::LiveView,
+        video_codec: codec,
+        min_frame_rate: 1,
+        max_frame_rate: ve.frame_rate.max(1),
+        min_width: 320,
+        min_height: 240,
+        max_width: ve.width,
+        max_height: ve.height,
+        min_bit_rate: 200_000,
+        max_bit_rate: (ve.bitrate as u32).saturating_mul(1000).max(500_000),
+        key_frame_interval: 2000,
+        watermark_enabled: None,
+        osd_enabled: None,
+        reference_count: 0,
+    };
+
+    if let Err(e) = seed_tx.try_send((slot, stream)) {
+        log::warn!(
+            "Failed to enqueue AV stream seed for camera {} slot {}: {}",
+            camera.id,
+            slot,
+            e
+        );
+    } else {
+        log::info!(
+            "Queued AV stream seed for camera {} slot {} ({}x{}@{}, codec={:?})",
+            camera.id,
+            slot,
+            ve.width,
+            ve.height,
+            ve.frame_rate,
+            codec
+        );
+    }
+}
+
 fn sanitize_stream_name(id: &str) -> String {
     id.chars()
         .map(|c| {
