@@ -3,7 +3,7 @@
 //! and provides proper mDNS response handling for remote controllers.
 
 use rs_matter::error::Error;
-use rs_matter::transport::network::mdns::zeroconf::ZeroconfMdnsResponder;
+use rs_matter::transport::network::mdns::zeroconf::ZeroconfMdns;
 use rs_matter::{crypto::Crypto, Matter};
 
 pub async fn run_mdns<C: Crypto>(
@@ -11,5 +11,5 @@ pub async fn run_mdns<C: Crypto>(
     _crypto: C,
 ) -> Result<(), Error> {
     log::info!("Starting mDNS via system service (zeroconf/avahi)");
-    ZeroconfMdnsResponder::new(matter).run().await
+    ZeroconfMdns::new().run(matter).await
 }

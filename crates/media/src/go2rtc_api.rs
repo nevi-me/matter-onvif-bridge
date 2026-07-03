@@ -22,6 +22,20 @@ struct StreamInfo {
     producers: Vec<StreamProducer>,
 }
 
+/// Registration state of a named stream in go2rtc.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamState {
+    /// No stream with this name is registered.
+    Absent,
+    /// Registered and the first producer URL matches ours.
+    Matches,
+    /// Registered under this name but with a different producer URL —
+    /// either a stale registration or go2rtc normalized the URL.
+    Differs { stored: String },
+    /// go2rtc unreachable or returned garbage.
+    Unknown,
+}
+
 /// go2rtc REST API client.
 #[derive(Clone)]
 pub struct Go2RtcApi {
@@ -130,25 +144,38 @@ impl Go2RtcApi {
         Ok(sdp_answer)
     }
 
-    /// Return true if go2rtc already has a stream named `name` whose first
-    /// producer URL matches `expected_url`. Used to skip redundant PUTs that
-    /// would otherwise return 400 Bad Request from go2rtc.
-    pub async fn stream_matches(&self, name: &str, expected_url: &str) -> bool {
+    /// Query the registration state of the stream named `name`.
+    ///
+    /// go2rtc returns 400 on `PUT /api/streams` when the name already
+    /// exists, and the producer URL it reports back is not always
+    /// byte-identical to what we registered (it may re-encode credentials
+    /// or normalize the URL), so equality against `expected_url` is only a
+    /// best-effort signal — callers must treat `Differs` as "re-register",
+    /// not as an error.
+    pub async fn stream_state(&self, name: &str, expected_url: &str) -> StreamState {
         let url = format!("{}/api/streams", self.base_url);
         let Ok(resp) = self.client.get(&url).send().await else {
-            return false;
+            return StreamState::Unknown;
         };
         if !resp.status().is_success() {
-            return false;
+            return StreamState::Unknown;
         }
         let Ok(streams) = resp.json::<HashMap<String, StreamInfo>>().await else {
-            return false;
+            return StreamState::Unknown;
         };
-        streams
-            .get(name)
-            .and_then(|s| s.producers.first())
-            .map(|p| p.url == expected_url)
-            .unwrap_or(false)
+        match streams.get(name) {
+            None => StreamState::Absent,
+            Some(s) => {
+                let stored = s.producers.first().map(|p| p.url.as_str()).unwrap_or("");
+                if stored == expected_url {
+                    StreamState::Matches
+                } else {
+                    StreamState::Differs {
+                        stored: stored.to_string(),
+                    }
+                }
+            }
+        }
     }
 
     /// Check if go2rtc is ready by polling the API endpoint.

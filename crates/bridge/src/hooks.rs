@@ -39,11 +39,19 @@ use media::go2rtc_api::Go2RtcApi;
 pub struct BridgeCamAvHooks;
 
 impl CameraAvStreamHooks for BridgeCamAvHooks {
-    async fn allocate_video(&self, _stream: &VideoStream) -> Result<(), CamAvError> {
-        // Controllers should not be allocating streams on us — the encoder
-        // set is fixed by the camera firmware. Refuse gracefully so chip-tool
-        // gets a clean status code instead of a panic.
-        Err(CamAvError::ResourceExhausted)
+    async fn allocate_video(&self, stream: &VideoStream) -> Result<(), CamAvError> {
+        // Accept every allocation the handler has already validated. Home
+        // Assistant's Matter Server sends VideoStreamAllocate before opening
+        // a WebRTC Live View session; the negotiated parameters are advisory
+        // for us because go2rtc serves whatever the camera's fixed RTSP
+        // profile encodes. Rejecting here (as we did originally) makes HA's
+        // Live View fail before it ever reaches ProvideOffer.
+        tracing::info!(
+            stream_id = stream.video_stream_id,
+            codec = ?stream.video_codec,
+            "accepting controller video stream allocation"
+        );
+        Ok(())
     }
 
     async fn modify_video(

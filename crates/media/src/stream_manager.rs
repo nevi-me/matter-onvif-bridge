@@ -4,9 +4,9 @@
 //! RTSP streams in go2rtc accordingly.
 
 use onvif_client::registry::{CameraRegistry, RegistryEvent};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
-use crate::go2rtc_api::Go2RtcApi;
+use crate::go2rtc_api::{Go2RtcApi, StreamState};
 
 /// Run the stream manager loop, listening for registry events.
 pub async fn run_stream_manager(
@@ -30,13 +30,36 @@ pub async fn run_stream_manager(
                     continue;
                 }
 
-                if api.stream_matches(&stream_name, &rtsp_url).await {
-                    info!(
-                        camera_id = camera.id,
-                        stream_name,
-                        "Stream already registered in go2rtc with matching URL, skipping"
-                    );
-                    continue;
+                match api.stream_state(&stream_name, &rtsp_url).await {
+                    StreamState::Matches => {
+                        info!(
+                            camera_id = camera.id,
+                            stream_name,
+                            "Stream already registered in go2rtc with matching URL, skipping"
+                        );
+                        continue;
+                    }
+                    StreamState::Differs { stored } => {
+                        // Name exists with a different (possibly just
+                        // normalized) producer URL. go2rtc rejects PUT on
+                        // an existing name with 400, so delete + re-add.
+                        warn!(
+                            camera_id = camera.id,
+                            stream_name,
+                            stored,
+                            "Stream registered with different URL — replacing"
+                        );
+                        if let Err(e) = api.remove_stream(&stream_name).await {
+                            error!(
+                                camera_id = camera.id,
+                                stream_name,
+                                err = %e,
+                                "Failed to remove stale stream before re-add"
+                            );
+                            continue;
+                        }
+                    }
+                    StreamState::Absent | StreamState::Unknown => {}
                 }
 
                 match api.add_stream(&stream_name, &rtsp_url).await {

@@ -13,7 +13,7 @@ matter-camera.workspace = true
 onvif-client.workspace = true
 media.workspace = true
 
-rs-matter = { git = "https://github.com/project-chip/rs-matter", package = "rs-matter", rev = "52c0fcd", features = ["async-io", "zeroconf"] }
+rs-matter = { version = "0.2.0", features = ["async-io", "zeroconf", "large-buffers"] }
 tokio.workspace = true
 async-channel = "2"
 static_cell = "2"

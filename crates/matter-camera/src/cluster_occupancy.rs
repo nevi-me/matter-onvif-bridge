@@ -10,8 +10,8 @@ use std::sync::Arc;
 use rs_matter::attributes;
 use rs_matter::commands;
 use rs_matter::dm::{
-    Access, Attribute, Cluster, Handler, InvokeContext, InvokeReply, NonBlockingHandler,
-    Quality, ReadContext, ReadReply, Reply, WriteContext,
+    Access, Attribute, Cluster, Handler, InvokeContext, InvokeReply, MatchContext,
+    NonBlockingHandler, Quality, ReadContext, ReadReply, Reply, WriteContext,
 };
 use rs_matter::error::{Error, ErrorCode};
 use strum::FromRepr;
@@ -134,6 +134,10 @@ impl Handler for OccupancyHandler {
 
     fn invoke(&self, _ctx: impl InvokeContext, _reply: impl InvokeReply) -> Result<(), Error> {
         Err(ErrorCode::CommandNotFound.into())
+    }
+
+    fn bump_dataver(&self, _ctx: impl MatchContext) {
+        self.dataver.bump();
     }
 }
 
